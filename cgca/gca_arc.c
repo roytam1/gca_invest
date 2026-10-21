@@ -57,6 +57,19 @@ static long gca_find_gcax(const unsigned char* image, size_t len)
     return -1;
 }
 
+/* The legacy containers: GCA0 (normal) and GCA1 (solid) are the
+ * pre-0.9 layouts, GCA3 can also stand alone as a whole file.  gcac.exe
+ * 0.9k reads all of them but only ever writes GCAX. */
+static int gca_is_legacy(const unsigned char* image, size_t len)
+{
+    if (len < 4)
+        return 0;
+    if (memcmp(image, "GCA0", 4) == 0 || memcmp(image, "GCA1", 4) == 0 ||
+        memcmp(image, "GCA3", 4) == 0)
+        return 1;
+    return 0;
+}
+
 /* ---------------------------------------------------------------- */
 /* directory parsing                                                 */
 /* Read the entry table and the names pool out of a directory body.
@@ -325,8 +338,13 @@ int gca_arc_open(const char* path, const char* spell, gca_archive* arc)
     arc->image_len = image_len;
 
     start = gca_find_gcax(image, image_len);
-    if (start < 0)
+    if (start < 0) {
+        if (gca_is_legacy(image, image_len)) {
+            arc->legacy = 1;
+            goto fail;
+        }
         goto fail;
+    }
     if (gca_rd32(image + start + 4) != 0)
         goto fail;                       /* the reader requires +4 == 0 */
     if (gca_rd32(image + start + 12) != 0)

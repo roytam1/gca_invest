@@ -165,6 +165,9 @@ typedef struct {
     size_t         plain_len;
     unsigned long  flags;
     int            solid;
+    /* 0 = the modern GCAX container, 1 = a legacy container
+       (GCA0 / GCA1 / a standalone GCA3) which is not supported */
+    int            legacy;
     unsigned long  num_files;
     gca_member*    members;
     size_t         payload_off; /* start of the payload region */
