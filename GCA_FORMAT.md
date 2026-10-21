@@ -321,7 +321,27 @@ them.
 
 ---
 
-## 8. Reproducing / verifying
+## 8. Implementations in this repository
+
+| where | what |
+|---|---|
+| `GcaSDK/` | the C++ decoder (nsGcaSDK compatible API) |
+| `cgca/` | a portable **C** packer and unpacker (`gcac_pack`, `gcac_unpack`) |
+
+The C tools are interoperable with `gcac.exe` in both directions: archives
+created by `gcac_pack` are extracted correctly by `gcac.exe`, and archives
+created by `gcac.exe` are extracted correctly by `gcac_unpack`.  This was
+verified for the `a`/`s`/`n` commands, for plain, `-p` and `-k` encryption,
+and for single and multi member archives.
+
+```
+cd cgca
+build.bat          (Visual C++ 6)   or   make   (anything else)
+build\gcac_pack.exe   out.gca  file.txt folder\
+build\gcac_unpack.exe out.gca -o dest
+```
+
+## 9. Reproducing / verifying
 
 ```
 build.bat                 -> build\gcasdk.lib, build\gcatest.exe

@@ -1,0 +1,677 @@
+/////////////////////////////////////////////////////////////////
+// gca_codec.c -- the GCA range coder, stages and frames.
+//
+// Transcribed from gcac.exe:
+//   sub_411740/411760/411790  range decoder state
+//   sub_412380/412720        bit / number decoding
+//   sub_411770/411B80/411800/411CA0/412000/411970  range encoder
+//   sub_40FC20/sub_40FE20    stage 1: MTF + run length
+//   sub_40EEC0/sub_40F1F0    Burrows-Wheeler transform
+//   sub_40FFD0/sub_4101B0    LZ stage
+//   sub_410410               frame writer
+/////////////////////////////////////////////////////////////////
+#include "gca.h"
+
+/* ---------------------------------------------------------------- */
+/* range decoder                                                     */
+void gca_rc_dec_init(gca_rc_dec* d, const unsigned char* data, size_t len,
+                     size_t pos)
+{
+    unsigned b;
+    d->data = data;
+    d->len = len;
+    d->pos = pos;
+    d->code = 0;
+    d->range = 0x80;
+    d->buf = 0;
+    /* one byte is discarded, then one byte is read */
+    if (d->pos < d->len)
+        d->pos++;
+    b = 0;
+    if (d->pos < d->len)
+        b = data[d->pos++];
+    d->buf = b;
+    d->code = b >> 1;
+}
+
+void gca_rc_dec_normalize(gca_rc_dec* d)
+{
+    while (d->range <= 0x800000UL) {
+        unsigned b = 0;
+        d->code = (((d->code << 1) | (d->buf & 1)) << 7) & 0xFFFFFFFFUL;
+        if (d->pos < d->len)
+            b = d->data[d->pos];
+        d->pos++;
+        d->buf = b;
+        d->code |= (b >> 1);
+        d->range = (d->range << 8) & 0xFFFFFFFFUL;
+    }
+}
+
+int gca_rc_dec_bit(gca_rc_dec* d, unsigned long prob, unsigned long* bound)
+{
+    gca_rc_dec_normalize(d);
+    *bound = (prob * (d->range >> 12)) & 0xFFFFFFFFUL;
+    if (d->code < *bound) {
+        d->range = *bound;
+        return 0;
+    }
+    d->code = (d->code - *bound) & 0xFFFFFFFFUL;
+    d->range = (d->range - *bound) & 0xFFFFFFFFUL;
+    return 1;
+}
+
+unsigned long gca_rc_dec_tree(gca_rc_dec* d, unsigned long* model, int node,
+                              int nbits, int shift)
+{
+    unsigned long v = 0;
+    int i;
+    for (i = 0; i < nbits; i++) {
+        unsigned long p = model[node];
+        unsigned long bound;
+        int b = gca_rc_dec_bit(d, p, &bound);
+        if (b) {
+            model[node] = p - (p >> shift);
+        } else {
+            model[node] = p + ((0x1000UL - p) >> shift);
+            d->range = bound;
+        }
+        node = b + 2 * node;
+        v = b + 2 * v;
+    }
+    return v;
+}
+
+unsigned long gca_rc_dec_number(gca_rc_dec* d, unsigned long* model, int nbits,
+                                int shift)
+{
+    int i = 0;
+    unsigned long raw = 0;
+    for (;;) {
+        unsigned long p = model[i];
+        unsigned long bound;
+        int b = gca_rc_dec_bit(d, p, &bound);
+        if (b) {
+            model[i] = p - (p >> shift);
+            break;
+        }
+        model[i] = p + ((0x1000UL - p) >> shift);
+        d->range = bound;
+        i++;
+        if (i >= nbits)
+            break;
+    }
+    if (i <= 1)
+        return (unsigned long)i;
+    {
+        int nb = i - 1;
+        while (nb > 0) {
+            unsigned long half;
+            gca_rc_dec_normalize(d);
+            half = d->range >> 1;
+            raw <<= 1;
+            if (d->code < half) {
+                d->range = half;
+            } else {
+                raw |= 1;
+                d->code = (d->code - half) & 0xFFFFFFFFUL;
+                d->range = (d->range - half) & 0xFFFFFFFFUL;
+            }
+            nb--;
+        }
+    }
+    return (1UL << ((unsigned long)(i - 1) & 31)) + raw;
+}
+
+/* ---------------------------------------------------------------- */
+/* range encoder                                                     */
+void gca_rc_enc_init(gca_rc_enc* e, gca_buf* out)
+{
+    e->out = out;
+    e->code = 0;
+    e->range = 0x80000000UL;
+    e->cache = 0;
+    e->cache_size = 0;
+}
+
+void gca_rc_enc_normalize(gca_rc_enc* e)
+{
+    while (e->range <= 0x800000UL) {
+        unsigned long c = e->code;
+        if (c < 0x7F800000UL) {
+            gca_buf_putc(e->out, (int)(e->cache & 0xFF));
+            while (e->cache_size > 0) {
+                gca_buf_putc(e->out, 0xFF);
+                e->cache_size--;
+            }
+            e->cache = (c >> 23) & 0xFF;
+        } else if (c < 0x80000000UL) {
+            e->cache_size++;
+        } else {
+            gca_buf_putc(e->out, (int)((e->cache + 1) & 0xFF));
+            while (e->cache_size > 0) {
+                gca_buf_putc(e->out, 0x00);
+                e->cache_size--;
+            }
+            e->cache = (c >> 23) & 0xFF;
+        }
+        e->range = (e->range << 8) & 0xFFFFFFFFUL;
+        e->code = (c & 0x7FFFFFUL) << 8;
+    }
+}
+
+void gca_rc_enc_bit(gca_rc_enc* e, unsigned long prob, int bit)
+{
+    unsigned long bound;
+    gca_rc_enc_normalize(e);
+    bound = (prob * (e->range >> 12)) & 0xFFFFFFFFUL;
+    if (bit) {
+        e->code = (e->code + bound) & 0xFFFFFFFFUL;
+        e->range = (e->range - bound) & 0xFFFFFFFFUL;
+    } else {
+        e->range = bound;
+    }
+}
+
+void gca_rc_enc_rawbits(gca_rc_enc* e, int nbits, unsigned long value)
+{
+    int i;
+    for (i = nbits - 1; i >= 0; i--) {
+        unsigned long half;
+        gca_rc_enc_normalize(e);
+        half = e->range >> 1;
+        if ((value >> i) & 1) {
+            e->code = (e->code + half) & 0xFFFFFFFFUL;
+            e->range = (e->range - half) & 0xFFFFFFFFUL;
+        } else {
+            e->range = half;
+        }
+    }
+}
+
+void gca_rc_enc_tree(gca_rc_enc* e, unsigned long* model, int node,
+                     unsigned long value, int nbits, int shift)
+{
+    int i;
+    for (i = nbits - 1; i >= 0; i--) {
+        int b = (int)((value >> i) & 1);
+        unsigned long p = model[node];
+        gca_rc_enc_bit(e, p, b);
+        if (b)
+            model[node] = p - (p >> shift);
+        else
+            model[node] = p + ((0x1000UL - p) >> shift);
+        node = b + 2 * node;
+    }
+}
+
+void gca_rc_enc_number(gca_rc_enc* e, unsigned long* model, unsigned long value,
+                       int nbits, int shift)
+{
+    int i = 0;
+    while ((value >> i) != 0) {
+        unsigned long p = model[i];
+        gca_rc_enc_bit(e, p, 0);
+        model[i] = p + ((0x1000UL - p) >> shift);
+        i++;
+        if (i >= nbits)
+            return;                     /* the scan ran out of levels */
+    }
+    {
+        unsigned long p = model[i];
+        gca_rc_enc_bit(e, p, 1);
+        model[i] = p - (p >> shift);
+    }
+    if (i > 1)
+        gca_rc_enc_rawbits(e, i - 1, value & ((1UL << (i - 1)) - 1));
+}
+
+void gca_rc_enc_flush(gca_rc_enc* e)
+{
+    int i;
+    while (e->range <= 0x800000UL)
+        gca_rc_enc_normalize(e);
+    if ((e->code & 0xFF800000UL) > 0x7F800000UL) {
+        gca_buf_putc(e->out, (int)((e->cache + 1) & 0xFF));
+        while (e->cache_size > 0) {
+            gca_buf_putc(e->out, 0x00);
+            e->cache_size--;
+        }
+    } else {
+        gca_buf_putc(e->out, (int)(e->cache & 0xFF));
+        while (e->cache_size > 0) {
+            gca_buf_putc(e->out, 0xFF);
+            e->cache_size--;
+        }
+    }
+    e->cache_size = 0;
+    e->cache = (e->code >> 23) & 0xFF;
+    gca_buf_putc(e->out, (int)(e->cache & 0xFF));
+    e->cache_size = 4;
+    for (i = 0; i < 4; i++)
+        gca_buf_putc(e->out, 0xFF);
+}
+
+/* ---------------------------------------------------------------- */
+/* stage 1: MTF + run length                                         */
+int gca_stage1_encode(const unsigned char* in, size_t n, gca_buf* out)
+{
+    unsigned long t256[256], t32[32];
+    unsigned char mtf[256];
+    gca_rc_enc e;
+    size_t i;
+    int j;
+
+    for (j = 0; j < 256; j++) {
+        t256[j] = 0x800;
+        mtf[j] = (unsigned char)j;
+    }
+    for (j = 0; j < 32; j++)
+        t32[j] = 0x800;
+
+    gca_rc_enc_init(&e, out);
+    if (n == 0) {
+        gca_rc_enc_flush(&e);
+        return 0;
+    }
+    {
+        unsigned char prev = in[0];
+        unsigned long run = 0;
+        for (i = 1; i < n; i++) {
+            unsigned char cur = in[i];
+            if (prev == cur) {
+                run++;
+                continue;
+            }
+            {
+                int pos = 0;
+                if (prev != mtf[0]) {
+                    for (pos = 0; pos < 256; pos++)
+                        if (mtf[pos] == prev) break;
+                    if (pos == 256) pos = 0;
+                }
+                gca_rc_enc_tree(&e, t256, 1, (unsigned long)((pos - 1) & 0xFF),
+                                8, 5);
+                gca_rc_enc_number(&e, t32, run, 32, 6);
+                while (pos > 0) {
+                    mtf[pos] = mtf[pos - 1];
+                    pos--;
+                }
+                mtf[0] = prev;
+            }
+            run = 0;
+            prev = cur;
+        }
+        {
+            int pos = 0;
+            if (prev != mtf[0]) {
+                for (pos = 0; pos < 256; pos++)
+                    if (mtf[pos] == prev) break;
+                if (pos == 256) pos = 0;
+            }
+            gca_rc_enc_tree(&e, t256, 1, (unsigned long)((pos - 1) & 0xFF),
+                            8, 5);
+            gca_rc_enc_number(&e, t32, run, 32, 6);
+        }
+    }
+    gca_rc_enc_flush(&e);
+    return 0;
+}
+
+int gca_stage1_decode(const unsigned char* in, size_t len, size_t total,
+                       gca_buf* out)
+{
+    unsigned long t256[256], t32[32];
+    unsigned char mtf[256];
+    gca_rc_dec d;
+    size_t produced = 0;
+    int j;
+
+    for (j = 0; j < 256; j++) {
+        t256[j] = 0x800;
+        mtf[j] = (unsigned char)j;
+    }
+    for (j = 0; j < 32; j++)
+        t32[j] = 0x800;
+
+    gca_rc_dec_init(&d, in, len, 0);
+    while (produced < total) {
+        unsigned long idx = gca_rc_dec_tree(&d, t256, 1, 8, 5);
+        unsigned long run = gca_rc_dec_number(&d, t32, 32, 6);
+        unsigned mi = (idx + 1) & 0xFF;
+        unsigned char sym = mtf[mi];
+        unsigned long n = run + 1;
+        while (mi > 0) {
+            mtf[mi] = mtf[mi - 1];
+            mi--;
+        }
+        mtf[0] = sym;
+        while (n > 0 && produced < total) {
+            gca_buf_putc(out, sym);
+            produced++;
+            n--;
+        }
+    }
+    return 0;
+}
+
+/* ---------------------------------------------------------------- */
+/* Burrows-Wheeler transform                                         */
+int gca_bwt_encode(const unsigned char* in, size_t n, gca_buf* out,
+                   unsigned long* prim)
+{
+    unsigned long *p, *pn, *c, *cn, *cnt;
+    size_t i, k;
+
+    *prim = 0;
+    if (n == 0)
+        return 0;
+    if (n == 1) {
+        gca_buf_putc(out, in[0]);
+        return 0;
+    }
+
+    p   = (unsigned long*)malloc(sizeof(unsigned long) * n);
+    pn  = (unsigned long*)malloc(sizeof(unsigned long) * n);
+    c   = (unsigned long*)malloc(sizeof(unsigned long) * n);
+    cn  = (unsigned long*)malloc(sizeof(unsigned long) * n);
+    /* the counting array is indexed by byte value in the first sort and
+       by class afterwards, so it must hold max(n, 256) entries */
+    cnt = (unsigned long*)malloc(sizeof(unsigned long) *
+                                 (n > 256 ? n + 1 : 256));
+    if (!p || !pn || !c || !cn || !cnt) {
+        free(p); free(pn); free(c); free(cn); free(cnt);
+        return -1;
+    }
+
+    /* initial sort by the first character */
+    for (i = 0; i < 256; i++) cnt[i] = 0;
+    for (i = 0; i < n; i++) cnt[in[i]]++;
+    for (i = 1; i < 256; i++) cnt[i] += cnt[i - 1];
+    for (i = n; i > 0; i--) p[--cnt[in[i - 1]]] = (unsigned long)(i - 1);
+    c[p[0]] = 0;
+    for (i = 1; i < n; i++)
+        c[p[i]] = c[p[i - 1]] + (in[p[i]] != in[p[i - 1]] ? 1 : 0);
+
+    /* prefix doubling */
+    for (k = 1; k < n; k <<= 1) {
+        unsigned long cls, maxc;
+        for (i = 0; i < n; i++) {
+            unsigned long v = p[i] - (unsigned long)k;
+            pn[i] = (p[i] >= (unsigned long)k) ? v : v + (unsigned long)n;
+        }
+        maxc = c[p[n - 1]] + 1;
+        for (i = 0; i < maxc; i++) cnt[i] = 0;
+        for (i = 0; i < n; i++) cnt[c[pn[i]]]++;
+        for (i = 1; i < maxc; i++) cnt[i] += cnt[i - 1];
+        for (i = n; i > 0; i--) p[--cnt[c[pn[i - 1]]]] = pn[i - 1];
+        cn[p[0]] = 0;
+        cls = 0;
+        for (i = 1; i < n; i++) {
+            unsigned long a = p[i], b = p[i - 1];
+            if (c[a] != c[b] ||
+                c[(a + (unsigned long)k) % (unsigned long)n] !=
+                c[(b + (unsigned long)k) % (unsigned long)n])
+                cls++;
+            cn[a] = cls;
+        }
+        { unsigned long* t = c; c = cn; cn = t; }
+    }
+
+    for (i = 0; i < n; i++) {
+        unsigned long idx = p[i];
+        unsigned long prev = (idx == 0) ? (unsigned long)(n - 1) : idx - 1;
+        gca_buf_putc(out, in[prev]);
+        if (idx == 0)
+            *prim = (unsigned long)i;
+    }
+
+    free(p); free(pn); free(c); free(cn); free(cnt);
+    return 0;
+}
+
+int gca_bwt_decode(const unsigned char* in, size_t n, unsigned long prim,
+                   gca_buf* out)
+{
+    unsigned count[256];
+    unsigned long* tmp;
+    unsigned long j;
+    size_t i;
+
+    if (n == 0)
+        return 0;
+    tmp = (unsigned long*)malloc(sizeof(unsigned long) * n);
+    if (!tmp)
+        return -1;
+    for (i = 0; i < 256; i++) count[i] = 0;
+    for (i = 0; i < n; i++) count[in[i]]++;
+    {
+        unsigned sum = 0;
+        for (i = 0; i < 256; i++) {
+            unsigned t = count[i];
+            count[i] = sum;
+            sum += t;
+        }
+    }
+    for (i = 0; i < n; i++) {
+        unsigned c = in[i];
+        tmp[count[c]] = (unsigned long)i;
+        count[c]++;
+    }
+    j = prim;
+    for (i = 0; i < n; i++) {
+        j = tmp[j];
+        gca_buf_putc(out, in[j]);
+    }
+    free(tmp);
+    return 0;
+}
+
+/* ---------------------------------------------------------------- */
+/* the LZ stage                                                      */
+#define GCA_LZ_MIN_MATCH 64
+
+int gca_lz_encode(const unsigned char* in, size_t n, gca_buf* lits,
+                  gca_buf* stream)
+{
+    unsigned long locA[32], locB[32];
+    unsigned long* table;
+    gca_rc_enc e;
+    size_t i = 0;
+    unsigned long litcount = 0;
+    unsigned h = 0;
+    int j;
+
+    for (j = 0; j < 32; j++) locA[j] = locB[j] = 0x800;
+    table = (unsigned long*)malloc(sizeof(unsigned long) * 65536);
+    if (!table)
+        return -1;
+    for (j = 0; j < 65536; j++) table[j] = 0xFFFFFFFFUL;
+
+    gca_rc_enc_init(&e, stream);
+    while (i < n) {
+        unsigned long cand = table[h & 0xFFFF];
+        size_t matchlen = 0;
+        if (cand != 0xFFFFFFFFUL && cand < i && in[cand] == in[i]) {
+            size_t j2 = 0;
+            while (i + j2 < n && in[cand + j2] == in[i + j2])
+                j2++;
+            matchlen = j2;
+        }
+        if (matchlen >= GCA_LZ_MIN_MATCH) {
+            gca_rc_enc_number(&e, locA, litcount, 32, 6);
+            gca_rc_enc_number(&e, locB,
+                              (unsigned long)(matchlen - GCA_LZ_MIN_MATCH),
+                              32, 6);
+            litcount = 0;
+            while (matchlen > 0) {
+                table[h & 0xFFFF] = (unsigned long)i;
+                h = ((h & 0xFF) << 8) | in[i];
+                i++;
+                matchlen--;
+            }
+        } else {
+            gca_buf_putc(lits, in[i]);
+            litcount++;
+            table[h & 0xFFFF] = (unsigned long)i;
+            h = ((h & 0xFF) << 8) | in[i];
+            i++;
+        }
+    }
+    gca_rc_enc_number(&e, locA, litcount, 32, 6);
+    gca_rc_enc_flush(&e);
+    free(table);
+    return 0;
+}
+
+int gca_lz_decode(const unsigned char* stream, size_t len,
+                  const unsigned char* lits, size_t litlen, size_t total,
+                  gca_buf* out)
+{
+    unsigned long locA[32], locB[32];
+    unsigned long* hist;
+    gca_rc_dec d;
+    size_t outpos = 0, litpos = 0;
+    unsigned h = 0;
+    int j;
+
+    for (j = 0; j < 32; j++) locA[j] = locB[j] = 0x800;
+    hist = (unsigned long*)malloc(sizeof(unsigned long) * 65536);
+    if (!hist)
+        return -1;
+    for (j = 0; j < 65536; j++) hist[j] = 0xFFFFFFFFUL;
+
+    gca_rc_dec_init(&d, stream, len, 0);
+    while (outpos < total) {
+        unsigned long v = gca_rc_dec_number(&d, locA, 32, 6);
+        unsigned long mlen, src;
+        while (v > 0 && outpos < total) {
+            unsigned char b;
+            if (litpos >= litlen)
+                break;
+            b = lits[litpos++];
+            gca_buf_putc(out, b);
+            hist[h & 0xFFFF] = (unsigned long)outpos;
+            h = ((h & 0xFF) << 8) | b;
+            outpos++;
+            v--;
+        }
+        if (outpos >= total)
+            break;
+        /* the match length is coded as (length - 64) and is used as is */
+        mlen = gca_rc_dec_number(&d, locB, 32, 6) + 64;
+        src = hist[h & 0xFFFF];
+        if (src == 0xFFFFFFFFUL || src > outpos)
+            break;
+        while (mlen > 0 && outpos < total) {
+            unsigned char b;
+            if (src >= outpos)
+                break;
+            b = out->data[src];
+            src++;
+            gca_buf_putc(out, b);
+            hist[h & 0xFFFF] = (unsigned long)outpos;
+            h = ((h & 0xFF) << 8) | b;
+            outpos++;
+            mlen--;
+        }
+    }
+    free(hist);
+    return 0;
+}
+
+/* ---------------------------------------------------------------- */
+/* frames                                                            */
+int gca_frame_write(gca_buf* out, const unsigned char* in, size_t n)
+{
+    gca_buf lits, stream, bwt, s1;
+    unsigned long prim = 0;
+    size_t frame_len;
+
+    gca_buf_init(&lits);
+    gca_buf_init(&stream);
+    gca_buf_init(&bwt);
+    gca_buf_init(&s1);
+
+    if (gca_lz_encode(in, n, &lits, &stream) != 0) {
+        gca_buf_free(&lits); gca_buf_free(&stream);
+        gca_buf_free(&bwt); gca_buf_free(&s1);
+        return -1;
+    }
+    if (gca_bwt_encode(lits.data, lits.len, &bwt, &prim) != 0) {
+        gca_buf_free(&lits); gca_buf_free(&stream);
+        gca_buf_free(&bwt); gca_buf_free(&s1);
+        return -1;
+    }
+    if (gca_stage1_encode(bwt.data, bwt.len, &s1) != 0) {
+        gca_buf_free(&lits); gca_buf_free(&stream);
+        gca_buf_free(&bwt); gca_buf_free(&s1);
+        return -1;
+    }
+
+    frame_len = 24 + s1.len + stream.len;
+    if (n <= 8 || frame_len >= n + 8) {
+        /* compression did not pay off: store the block */
+        gca_buf_puts(out, "GCF0");
+        gca_buf_put32(out, (unsigned long)n);
+        gca_buf_put(out, in, n);
+    } else {
+        gca_buf_puts(out, "GCF1");
+        gca_buf_put32(out, (unsigned long)n);          /* original size   */
+        gca_buf_put32(out, (unsigned long)lits.len);   /* literal count   */
+        gca_buf_put32(out, prim);                     /* BWT primary     */
+        gca_buf_put32(out, (unsigned long)s1.len);    /* stage 1 length  */
+        gca_buf_put32(out, (unsigned long)stream.len);/* LZ stream length*/
+        gca_buf_put(out, s1.data, s1.len);
+        gca_buf_put(out, stream.data, stream.len);
+    }
+
+    gca_buf_free(&lits); gca_buf_free(&stream);
+    gca_buf_free(&bwt); gca_buf_free(&s1);
+    return 0;
+}
+
+int gca_frame_decode(const unsigned char* p, size_t avail, size_t* consumed,
+                     size_t* orig, gca_buf* out)
+{
+    if (avail < 8)
+        return -1;
+    if (memcmp(p, "GCF0", 4) == 0) {
+        unsigned long n = gca_rd32(p + 4);
+        if (8 + n > avail)
+            return -1;
+        *consumed = 8 + n;
+        *orig = n;
+        return gca_buf_put(out, p + 8, n);
+    }
+    if (avail >= 24 && memcmp(p, "GCF1", 4) == 0) {
+        unsigned long ex   = gca_rd32(p + 4);
+        unsigned long lit  = gca_rd32(p + 8);
+        unsigned long prim = gca_rd32(p + 12);
+        unsigned long s1   = gca_rd32(p + 16);
+        unsigned long s2   = gca_rd32(p + 20);
+        gca_buf bwt, lits, dec;
+        int rc = -1;
+
+        if (24 + s1 + s2 > avail)
+            return -1;
+        gca_buf_init(&bwt);
+        gca_buf_init(&lits);
+        gca_buf_init(&dec);
+
+        if (gca_stage1_decode(p + 24, s1, lit, &bwt) == 0 &&
+            gca_bwt_decode(bwt.data, bwt.len, prim, &lits) == 0 &&
+            gca_lz_decode(p + 24 + s1, s2, lits.data, lits.len, ex, &dec) == 0 &&
+            dec.len == ex) {
+            gca_buf_put(out, dec.data, dec.len);
+            *consumed = 24 + s1 + s2;
+            *orig = ex;
+            rc = 0;
+        }
+        gca_buf_free(&bwt);
+        gca_buf_free(&lits);
+        gca_buf_free(&dec);
+        return rc;
+    }
+    return -1;
+}

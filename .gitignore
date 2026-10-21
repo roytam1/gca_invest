@@ -1,2 +1,4 @@
 # Build output of build.bat (MSVC6 objects, library and test driver).
 build/
+# Build output of cgca/build.bat
+cgca/build/

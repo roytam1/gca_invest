@@ -11,7 +11,8 @@ rem PATH).  cl.exe's internal link step fails silently for that reason,
 rem so compile and link in two explicit steps.
 rem ------------------------------------------------------------------
 call "C:\Program Files (x86)\Microsoft Visual Studio\VC98\Bin\VCVARS32.BAT" >nul 2>&1
-cd /d "%~dp0"
+rem "%~dp0." keeps the trailing backslash from escaping the quote
+pushd "%~dp0."
 
 if not exist build mkdir build
 del /q build\* 2>nul
