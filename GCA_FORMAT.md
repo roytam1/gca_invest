@@ -319,7 +319,7 @@ SHA-1 used by `-k`.
 |-------|---------|
 | `GCA0` | legacy container, normal (one payload stream per member) |
 | `GCA1` | legacy container, solid (one payload stream for every member) |
-| `GCA3` | a directory block standing on its own, without a GCAX envelope |
+| `GCA3` | a directory block standing on its own, without a GCAX envelope — **not supported**, see §7.5 |
 
 The layout was confirmed against two real archives: `gcasdk_v09d.gca`
 (GCA1, written by the GCA SDK 0.9d) and `gcatxt.gca` (GCA0, written by the
@@ -412,6 +412,33 @@ CRC-32.  The CRC covers **everything from the start of the file up to and
 including the four zero bytes**, i.e. the header and the whole directory
 but not the CRC field itself.  This is the same convention as the GCA3
 directory CRC (§2.2).  **[V]**
+
+### 7.5 A standalone "GCA3" file — not supported
+
+`"GCA3"` is the **directory block** magic, not a file container.  Inside
+a GCAX archive it sits at `dirOffset`, after the payload; it never
+appears at offset 0 of a well formed archive.
+
+`gcac.exe`'s reader nevertheless dispatches on a file that *starts* with
+`"GCA3"`: it seeks to the start and hands the file to the same routine
+that reads an embedded directory block (`gcac.exe.lst:40AC14` →
+`sub_40B9E0`).  That routine takes the origin of the payload to be the
+block position plus `0x10` (`gcac.exe.lst:40BA49`) — the same value it
+uses for the GCAX envelope (`gcac.exe.lst:40ACBF`) — which only makes
+sense for an enveloped archive.
+
+Synthesising a standalone GCA3 file from a real archive shows that the
+path is not functional:
+
+| layout | what gcac.exe does |
+|--------|--------------------|
+| the directory block first, the payload behind it | reads the directory correctly, then decodes the payload from the wrong offset and writes a garbage file |
+| the payload first, the directory block behind it | rejects the file outright |
+
+**We do not implement this variant.**  `GcaSDK` returns
+`GCA_PARSE_UNSUPPORTED` for a top level `"GCA3"`, and `gcac_unpack`
+reports it as an unsupported container.  A standalone GCA3 file is
+treated as an unknown format rather than a GCA archive.  **[V]**
 
 ---
 
