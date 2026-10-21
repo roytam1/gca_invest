@@ -1,0 +1,2 @@
+# Build output of build.bat (MSVC6 objects, library and test driver).
+build/
