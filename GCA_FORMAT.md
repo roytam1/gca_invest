@@ -321,10 +321,11 @@ SHA-1 used by `-k`.
 | `GCA1` | legacy container, solid (one payload stream for every member) |
 | `GCA3` | a directory block standing on its own, without a GCAX envelope — **not supported**, see §7.5 |
 
-The layout was confirmed against two real archives: `gcasdk_v09d.gca`
-(GCA1, written by the GCA SDK 0.9d) and `gcatxt.gca` (GCA0, written by the
-GCA SDK 0.9e).  `gcac.exe`, the C tools in `cgca/` and the C++ SDK all
-extract both of them byte identically. **[V]**
+The layout was confirmed against two real archives, kept in `fixtures/`:
+`fixtures/gcasdk_v09d.gca` (GCA1, written by the GCA SDK 0.9d) and
+`fixtures/gcatxt.gca` (GCA0, written by the GCA SDK 0.9e).  `gcac.exe`,
+the C tools in `cgca/` and the C++ SDK all extract both of them byte
+identically. **[V]**
 
 Both legacy layouts have a header variant word at `+0x04`:
 
@@ -402,7 +403,8 @@ The payload region starts at `hdr` and holds ordinary frames — `GCF0`,
 `GCF1` or `GCF2`.  In a `GCA1` (solid) archive the whole region is one
 stream shared by every member and the members are sliced by their original
 sizes; in a `GCA0` archive the members follow each other, each occupying
-the number of bytes given in its entry.  The sample `gcasdk_v09d.gca` uses
+the number of bytes given in its entry.  The sample
+`fixtures/gcasdk_v09d.gca` uses
 a single `GCF2` frame with the mode word `0x00201030`.
 
 ### 7.4 The trailer
@@ -461,6 +463,9 @@ cd cgca
 build.bat          (Visual C++ 6)   or   make   (anything else)
 build\gcac_pack.exe   out.gca  file.txt folder\
 build\gcac_unpack.exe out.gca -o dest
+
+python roundtrip.py    # packs, extracts with gcac.exe and with the C
+                       # tools and compares everything byte for byte
 ```
 
 ## 9. Reproducing / verifying
@@ -472,6 +477,14 @@ build\gcatest.exe <archive.gca> [outdir] [spell]
 
 `spell` is the password (the raw `-p` text, or the lower case hex SHA-1 of the
 `-k` key file).  Without it, encrypted archives report `OPEN_FAILED`.
+
+The two legacy archives in `fixtures/` are checked by `cgca/roundtrip.py`
+as well:
+
+```
+build\gcac_unpack.exe fixtures\gcasdk_v09d.gca -o dest   # GCA1, solid
+build\gcac_unpack.exe fixtures\gcatxt.gca       -o dest   # GCA0, plain
+```
 
 The corpus used while writing this document was produced with:
 

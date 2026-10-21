@@ -105,9 +105,9 @@ def main():
             check("we extract gcac.exe's %s archive" % mode,
                   rc == 0 and tree(out) == expect)
 
-    # the legacy containers, if they are in the repository root
+    # the legacy containers, if the fixtures are present
     for legacy in ("gcasdk_v09d.gca", "gcatxt.gca"):
-        path = os.path.join(ROOT, legacy)
+        path = os.path.join(ROOT, "fixtures", legacy)
         if not os.path.exists(path):
             continue
         out = os.path.join(tmp, "leg_" + legacy)

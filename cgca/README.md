@@ -14,7 +14,11 @@
 //   Windows (Visual C++ 6):   build.bat
 //   anything else:            make
 //
-// The format is documented in ../GCA_FORMAT.md.
+//   python roundtrip.py       packs, extracts with gcac.exe and with
+//                             these tools and compares byte for byte
+//
+// The format is documented in ../GCA_FORMAT.md.  Two legacy archives
+// (fixtures/ in the repository root) are used as test fixtures.
 //
 // Packer options
 //   -s         solid mode: every member shares one payload stream
