@@ -58,14 +58,14 @@ static long gca_find_gcax(const unsigned char* image, size_t len)
 }
 
 /* The legacy containers: GCA0 (normal) and GCA1 (solid) are the
- * pre-0.9 layouts, GCA3 can also stand alone as a whole file.  gcac.exe
- * 0.9k reads all of them but only ever writes GCAX. */
-static int gca_is_legacy(const unsigned char* image, size_t len)
+ * pre-0.9 layouts.  gcac.exe 0.9k reads them but only ever writes
+ * GCAX.  A standalone "GCA3" file is a directory block without the
+ * GCAX envelope; that variant is not supported here. */
+static int gca_is_unsupported_container(const unsigned char* image, size_t len)
 {
     if (len < 4)
         return 0;
-    if (memcmp(image, "GCA0", 4) == 0 || memcmp(image, "GCA1", 4) == 0 ||
-        memcmp(image, "GCA3", 4) == 0)
+    if (memcmp(image, "GCA3", 4) == 0)
         return 1;
     return 0;
 }
@@ -149,6 +149,174 @@ fail:
     gca_buf_free(&ents);
     gca_buf_free(&names);
     return -1;
+}
+
+/* ---------------------------------------------------------------- */
+/* the legacy containers: GCA0 (normal) and GCA1 (solid)               */
+/*                                                                     */
+/* These are the pre-0.9 layouts.  gcac.exe 0.9k reads them but never */
+/* writes them; the current container is always GCAX.                  */
+/*                                                                     */
+/* The header (36 bytes for the "plain" variant):                     */
+/*   +0x00 "GCA0" / "GCA1"                                            */
+/*   +0x04 u32 the header variant (2 = plain directory, 3 = the       */
+/*        directory is stored as two GCF1 frames)                      */
+/*   +0x08 u32 the number of members                                  */
+/*   +0x0C u32 the offset of the payload region                       */
+/*   +0x10 u32 flags (meaning unknown)                                 */
+/*   +0x14 u32 the CRC-32 of the first member's content               */
+/*   +0x18 u32 (unidentified)                                          */
+/*   +0x1C u32 the first member's stored size                         */
+/*   +0x20 u32 the first member's original size                       */
+/*   +0x24 the directory                                               */
+/*                                                                     */
+/* The directory of the plain variant:                                */
+/*   (cnt-1) 32 byte entries, then the first member's 12 byte record  */
+/*   {+0 size, +4 FILETIME low, +8 FILETIME high}, then the names    */
+/*   pool (one byte length + the name, cnt times).  The block ends   */
+/*   with four zero bytes and the CRC-32 of everything before them.   */
+/*                                                                     */
+/* The directory of the compressed variant (variant 3) is two GCF1    */
+/* frames: the 32 byte entry table and the names pool.  Every entry  */
+/* is a full 32 byte record:                                          */
+/*   +0x00 u32 attributes        +0x04 u32 CRC-32 of the content      */
+/*   +0x08 u32 (zero)            +0x0C u32 the stored size           */
+/*   +0x10 u32 the original size +0x14 u32 32 (the entry size)       */
+/*   +0x18 u64 FILETIME                                                 */
+/* ---------------------------------------------------------------- */
+static int gca_arc_open_legacy(gca_archive* arc, const unsigned char* image,
+                               size_t len, long start)
+{
+    unsigned long ver, cnt, hdr, i;
+    size_t eoff, namesPos;
+    gca_buf ents, names;
+    int rc = -1;
+
+    gca_buf_init(&ents);
+    gca_buf_init(&names);
+
+    ver = gca_rd32(image + start + 4);
+    cnt = gca_rd32(image + start + 8);
+    hdr = gca_rd32(image + start + 12);
+    if (cnt == 0 || cnt > 100000)
+        goto done;
+    if (start + hdr > len || hdr < 0x24)
+        goto done;
+
+    arc->members = (gca_member*)calloc(cnt, sizeof(gca_member));
+    if (!arc->members)
+        goto done;
+
+    if (ver == 3) {
+        /* the directory is two GCF1 frames */
+        size_t consumed, orig, p;
+        if (start + 0x14 + 24 > len)
+            goto done;
+        if (gca_frame_decode(image + start + 0x14, len - start - 0x14,
+                             &consumed, &orig, &ents) != 0)
+            goto done;
+        if (ents.len != (size_t)(cnt * 32))
+            goto done;
+        p = (size_t)start + 0x14 + consumed;
+        if (p + 24 > len)
+            goto done;
+        if (gca_frame_decode(image + p, len - p, &consumed, &orig,
+                             &names) != 0)
+            goto done;
+        for (i = 0; i < cnt; i++) {
+            const unsigned char* e = ents.data + i * 32;
+            gca_member* m = &arc->members[i];
+            m->attr        = gca_rd32(e + 0x00);
+            m->crc         = gca_rd32(e + 0x04);
+            m->stored_size = gca_rd32(e + 0x0C);
+            m->orig_size   = gca_rd32(e + 0x10);
+            m->ft_lo       = gca_rd32(e + 0x18);
+            m->ft_hi       = gca_rd32(e + 0x1C);
+        }
+        namesPos = 0;
+        for (i = 0; i < cnt; i++) {
+            unsigned long n;
+            if (namesPos >= names.len)
+                goto done;
+            n = names.data[namesPos++];
+            if (n == 0 || namesPos + n > names.len)
+                goto done;
+            arc->members[i].name = (char*)malloc(n + 1);
+            if (!arc->members[i].name)
+                goto done;
+            memcpy(arc->members[i].name, names.data + namesPos, n);
+            arc->members[i].name[n] = '\0';
+            namesPos += n;
+        }
+    } else {
+        /* the plain directory */
+        eoff = (size_t)start + 0x24;
+        if (eoff + 32 * (cnt - 1) + 12 > len)
+            goto done;
+        for (i = 1; i < cnt; i++) {
+            const unsigned char* e = image + eoff + 32 * (i - 1);
+            gca_member* m = &arc->members[i];
+            m->ft_lo       = gca_rd32(e + 0x04);
+            m->ft_hi       = gca_rd32(e + 0x08);
+            m->attr        = gca_rd32(e + 0x0C);
+            m->crc         = gca_rd32(e + 0x10);
+            m->stored_size = gca_rd32(e + 0x18);
+            m->orig_size   = gca_rd32(e + 0x1C);
+        }
+        eoff += 32 * (cnt - 1);
+        arc->members[0].ft_lo = gca_rd32(image + eoff + 4);
+        arc->members[0].ft_hi = gca_rd32(image + eoff + 8);
+        eoff += 12;
+        namesPos = eoff;
+        for (i = 0; i < cnt; i++) {
+            unsigned long n;
+            if (namesPos >= len)
+                goto done;
+            n = image[namesPos++];
+            if (n == 0 || namesPos + n > len)
+                goto done;
+            arc->members[i].name = (char*)malloc(n + 1);
+            if (!arc->members[i].name)
+                goto done;
+            memcpy(arc->members[i].name, image + namesPos, n);
+            arc->members[i].name[n] = '\0';
+            namesPos += n;
+        }
+        /* the first member's sizes and CRC live in the header */
+        arc->members[0].crc         = gca_rd32(image + start + 0x14);
+        arc->members[0].stored_size = gca_rd32(image + start + 0x1C);
+        arc->members[0].orig_size   = gca_rd32(image + start + 0x20);
+    }
+
+    /* the payload region */
+    arc->payload_off = (size_t)start + hdr;
+    arc->payload_len = len - arc->payload_off;
+    if (arc->solid) {
+        /* GCA1: one stream shared by every member */
+        for (i = 0; i < cnt; i++) {
+            arc->members[i].data_off = (unsigned long)arc->payload_off;
+            arc->members[i].stored_size = (unsigned long)arc->payload_len;
+        }
+    } else {
+        size_t pos = arc->payload_off;
+        for (i = 0; i < cnt; i++) {
+            arc->members[i].data_off = (unsigned long)pos;
+            pos += arc->members[i].stored_size;
+            if (pos > len)
+                goto done;
+        }
+    }
+    arc->num_files = cnt;
+    arc->flags = gca_rd32(image + start + 16);
+    arc->rawPayload = 0;
+    rc = 0;
+
+done:
+    gca_buf_free(&ents);
+    gca_buf_free(&names);
+    if (rc != 0)
+        return -1;
+    return 0;
 }
 
 /* ---------------------------------------------------------------- */
@@ -339,11 +507,19 @@ int gca_arc_open(const char* path, const char* spell, gca_archive* arc)
 
     start = gca_find_gcax(image, image_len);
     if (start < 0) {
-        if (gca_is_legacy(image, image_len)) {
-            arc->legacy = 1;
+        /* the legacy containers: GCA0 (normal) and GCA1 (solid) */
+        if (image_len >= 4 && memcmp(image, "GCA0", 4) == 0)
+            arc->solid = 0;
+        else if (image_len >= 4 && memcmp(image, "GCA1", 4) == 0)
+            arc->solid = 1;
+        else {
+            if (gca_is_unsupported_container(image, image_len))
+                arc->legacy = 1;
             goto fail;
         }
-        goto fail;
+        if (gca_arc_open_legacy(arc, image, image_len, 0) != 0)
+            goto fail;
+        return 0;
     }
     if (gca_rd32(image + start + 4) != 0)
         goto fail;                       /* the reader requires +4 == 0 */
@@ -393,6 +569,7 @@ int gca_arc_open(const char* path, const char* spell, gca_archive* arc)
     arc->num_files = numFiles;
     arc->flags = flags;
     arc->solid = (flags & GCA_FLAG_SOLID) ? 1 : 0;
+    arc->rawPayload = (flags & GCA_FLAG_PAYCOMPRESSED) ? 0 : 1;
 
     /* the payload offsets */
     payloadOff = (size_t)start + 0x10;
@@ -483,6 +660,8 @@ int gca_arc_extract(gca_archive* arc, unsigned long index, const char* outdir)
 
     if (outdir && *outdir) {
         size_t n = strlen(outdir);
+        /* make sure the output directory exists */
+        gca_mkpath(outdir);
         if (n + 1 + strlen(m->name) + 1 >= sizeof(path))
             return -1;
         strcpy(path, outdir);
@@ -537,7 +716,7 @@ int gca_arc_extract(gca_archive* arc, unsigned long index, const char* outdir)
         size_t p = m->data_off;
         size_t left = m->stored_size;
         unsigned long produced = 0;
-        if (!(arc->flags & GCA_FLAG_PAYCOMPRESSED)) {
+        if (arc->rawPayload) {
             /* the "no compression" mode stores the member verbatim */
             if (left > arc->image_len - p)
                 left = arc->image_len - p;

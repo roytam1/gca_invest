@@ -112,6 +112,12 @@ int gca_stage1_encode(const unsigned char* in, size_t n, gca_buf* out);
 int gca_stage1_decode(const unsigned char* in, size_t len, size_t total,
                        gca_buf* out);
 
+/* stage 1 of a GCF2 frame: the MTF/RLE stage with the mode selected
+   coders (gcac.exe sub_40F460 / sub_40F8E0).  The mode word is
+   documented in GCA_FORMAT.md. */
+int gca_var_decode(const unsigned char* in, size_t len, size_t total,
+                   unsigned long mode, gca_buf* out);
+
 /* Burrows-Wheeler transform (gcac.exe sub_40EEC0 / sub_40F1F0) */
 int gca_bwt_encode(const unsigned char* in, size_t n, gca_buf* out,
                    unsigned long* prim);
@@ -165,6 +171,8 @@ typedef struct {
     size_t         plain_len;
     unsigned long  flags;
     int            solid;
+    /* the payload is stored verbatim instead of being framed */
+    int            rawPayload;
     /* 0 = the modern GCAX container, 1 = a legacy container
        (GCA0 / GCA1 / a standalone GCA3) which is not supported */
     int            legacy;

@@ -38,4 +38,7 @@
 //     uses.
 //   * The archive may be embedded in a larger file (an SFX stub): the
 //     unpacker locates the GCAX header automatically.
+//   * The unpacker also reads the legacy GCA0 and GCA1 containers (the
+//     pre-0.9 layouts, see ../GCA_FORMAT.md section 7).  A
+//     standalone GCA3 file is not supported.
 /////////////////////////////////////////////////////////////////

@@ -145,8 +145,7 @@ against plain, solid and encrypted archives.
 For each entry, in order: a **u16 little endian** length followed by that many
 raw bytes of the stored path.  No NUL terminator.  The bytes are whatever the
 platform produced (ANSI code page, no transcoding).  The legacy GCA0/GCA1
-format uses a 1 byte length unless the next byte is `< 0x20`, in which case a
-16 bit length follows — that rule does **not** apply here. **[D]**
+containers use a plain **one byte** length instead (see §7). **[V]**
 
 ### 2.5 Compressed directory body
 
@@ -313,11 +312,106 @@ SHA-1 used by `-k`.
 
 ## 7. Legacy containers
 
-`gcac.exe` 0.9k **only writes** the GCAX/GCA3 container described above.  The
-older `"GCA0"` / `"GCA1"` magics are read-only in that binary; they use a
-completely different layout (a 36 byte header, 1/2 byte name lengths, a
-different directory shape).  `GcaSDK/gca_arc.cpp` still carries a reader for
-them.
+`gcac.exe` 0.9k **only writes** the GCAX/GCA3 container described above, but it
+**reads** two older layouts:
+
+| magic | meaning |
+|-------|---------|
+| `GCA0` | legacy container, normal (one payload stream per member) |
+| `GCA1` | legacy container, solid (one payload stream for every member) |
+| `GCA3` | a directory block standing on its own, without a GCAX envelope |
+
+The layout was confirmed against two real archives: `gcasdk_v09d.gca`
+(GCA1, written by the GCA SDK 0.9d) and `gcatxt.gca` (GCA0, written by the
+GCA SDK 0.9e).  `gcac.exe`, the C tools in `cgca/` and the C++ SDK all
+extract both of them byte identically. **[V]**
+
+Both legacy layouts have a header variant word at `+0x04`:
+
+* **variant 2** — the directory is stored in the clear;
+* **variant 3** — the directory is stored as two `GCF1` frames.
+
+### 7.1 Variant 2 — the plain directory
+
+```
++0x00  4  "GCA0" / "GCA1"
++0x04  4  the header variant (2)
++0x08  4  the number of members
++0x0C  4  hdr — the offset of the payload region
++0x10  4  flags (meaning unknown)
++0x14  4  the CRC-32 of the first member's content
++0x18  4  (unidentified)
++0x1C  4  the first member's stored size
++0x20  4  the first member's original size
++0x24  .. the directory
+```
+
+The directory:
+
+```
+(cnt-1) 32 byte entries
+the first member's 12 byte record: {u32 32, u32 FILETIME low, u32 FILETIME high}
+the names pool: cnt times (one byte length + the name)
+4 zero bytes
+u32  the CRC-32 of everything from the start of the file up to and
+     including those 4 zero bytes
+```
+
+The 32 byte entries:
+
+| off | value |
+|-----|-------|
+| +0x00 | 32 (the entry size) |
+| +0x04 | FILETIME low |
+| +0x08 | FILETIME high |
+| +0x0C | `dwFileAttributes` |
+| +0x10 | CRC-32 of the content |
+| +0x14 | (unused) |
+| +0x18 | the stored size |
+| +0x1C | the original size |
+
+### 7.2 Variant 3 — the compressed directory
+
+```
++0x00  4  "GCA0" / "GCA1"
++0x04  4  the header variant (3)
++0x08  4  the number of members
++0x0x0C 4  hdr — the offset of the payload region
++0x10  4  flags (meaning unknown)
++0x14  .. a GCF1 frame holding the entry table (cnt * 32 bytes)
+         a GCF1 frame holding the names pool
+         4 zero bytes
+         u32 the CRC-32 of everything before it
+```
+
+The 32 byte entries here have a different field order:
+
+| off | value |
+|-----|-------|
+| +0x00 | `dwFileAttributes` |
+| +0x04 | CRC-32 of the content |
+| +0x08 | 0 |
+| +0x0C | the stored size |
+| +0x10 | the original size |
+| +0x14 | 32 (the entry size) |
+| +0x18 | FILETIME (low, high) |
+
+### 7.3 The payload
+
+The payload region starts at `hdr` and holds ordinary frames — `GCF0`,
+`GCF1` or `GCF2`.  In a `GCA1` (solid) archive the whole region is one
+stream shared by every member and the members are sliced by their original
+sizes; in a `GCA0` archive the members follow each other, each occupying
+the number of bytes given in its entry.  The sample `gcasdk_v09d.gca` uses
+a single `GCF2` frame with the mode word `0x00201030`.
+
+### 7.4 The trailer
+
+Both variants end their directory with four zero bytes followed by a
+CRC-32.  The CRC covers **everything from the start of the file up to and
+including the four zero bytes**, i.e. the header and the whole directory
+but not the CRC field itself.  This is the same convention as the GCA3
+directory CRC (§2.2).  **[V]**
 
 ---
 
@@ -332,7 +426,8 @@ The C tools are interoperable with `gcac.exe` in both directions: archives
 created by `gcac_pack` are extracted correctly by `gcac.exe`, and archives
 created by `gcac.exe` are extracted correctly by `gcac_unpack`.  This was
 verified for the `a`/`s`/`n` commands, for plain, `-p` and `-k` encryption,
-and for single and multi member archives.
+and for single and multi member archives.  They also read the legacy
+`GCA0`/`GCA1` containers (§7).
 
 ```
 cd cgca

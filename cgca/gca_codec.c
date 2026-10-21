@@ -356,6 +356,247 @@ int gca_stage1_decode(const unsigned char* in, size_t len, size_t total,
 }
 
 /* ---------------------------------------------------------------- */
+/* the GCF2 stage 1: MTF/RLE with the mode selected coders           */
+/*                                                                     */
+/* The mode word (gcac.exe sub_40F8E0):                               */
+/*   bit 28   MTF enable                                               */
+/*   bit 24   run length enable                                        */
+/*   >>20 &F  the symbol coder: 0 plain, 2 averaged, else weighted     */
+/*   >>16 &F  the number coder: 0 plain, else weighted                 */
+/*   >>12 &F  the adaptation shift of the symbol tree                 */
+/*   >>8  &F  the adaptation shift of the number coder                */
+/*   >>4  &F  the adaptation shift of the context tables              */
+/*   bit 31   the literals were noised by the encoder                 */
+/* ---------------------------------------------------------------- */
+
+/* the mixed symbol tree: t1 adapts with shift, t2 with x */
+static unsigned long gca_rc_dec_tree_mixed(gca_rc_dec* d, unsigned long* t1,
+                                           unsigned long* t2, int node,
+                                           int nbits, int shift, int x,
+                                           int w)
+{
+    unsigned sc = ((unsigned)shift) & 31;
+    unsigned xc = ((unsigned)x) & 31;
+    unsigned long v = 0;
+    int i;
+    if (nbits <= 0)
+        return 0;
+    for (i = 0; i < nbits; i++) {
+        unsigned long mixed, bound;
+        int b;
+        gca_rc_dec_normalize(d);
+        mixed = (t1[node] * (unsigned long)(4 - w) +
+                 t2[node] * (unsigned long)w) >> 2;
+        bound = (d->range >> 12) * mixed;
+        if (d->code < bound) {
+            unsigned long a, b2;
+            d->range = bound;
+            a = t1[node]; t1[node] = a + ((0x1000UL - a) >> sc);
+            b2 = t2[node]; t2[node] = b2 + ((0x1000UL - b2) >> xc);
+            b = 0;
+        } else {
+            unsigned long a, b2;
+            d->code = (d->code - bound) & 0xFFFFFFFFUL;
+            d->range = (d->range - bound) & 0xFFFFFFFFUL;
+            a = t1[node]; t1[node] = a - (a >> sc);
+            b2 = t2[node]; t2[node] = b2 - (b2 >> xc);
+            b = 1;
+        }
+        node = b + 2 * node;
+        v = b + 2 * v;
+    }
+    return v;
+}
+
+/* the averaged symbol tree: (t1[node] + t2[node]) >> 1 */
+static unsigned long gca_rc_dec_tree_mixed2(gca_rc_dec* d, unsigned long* t1,
+                                            unsigned long* t2, int node,
+                                            int nbits, int shift, int x)
+{
+    unsigned sc = ((unsigned)shift) & 31;
+    unsigned xc = ((unsigned)x) & 31;
+    unsigned long v = 0;
+    int i;
+    if (nbits <= 0)
+        return 0;
+    for (i = 0; i < nbits; i++) {
+        unsigned long mixed, bound;
+        int b;
+        gca_rc_dec_normalize(d);
+        mixed = (t1[node] + t2[node]) >> 1;
+        bound = (d->range >> 12) * mixed;
+        if (d->code < bound) {
+            unsigned long a, b2;
+            d->range = bound;
+            a = t1[node]; t1[node] = a + ((0x1000UL - a) >> sc);
+            b2 = t2[node]; t2[node] = b2 + ((0x1000UL - b2) >> xc);
+            b = 0;
+        } else {
+            unsigned long a, b2;
+            d->code = (d->code - bound) & 0xFFFFFFFFUL;
+            d->range = (d->range - bound) & 0xFFFFFFFFUL;
+            a = t1[node]; t1[node] = a - (a >> sc);
+            b2 = t2[node]; t2[node] = b2 - (b2 >> xc);
+            b = 1;
+        }
+        node = b + 2 * node;
+        v = b + 2 * v;
+    }
+    return v;
+}
+
+/* the mixed number coder: t1 adapts with shift, t2 with x */
+static unsigned long gca_rc_dec_number_mixed(gca_rc_dec* d, unsigned long* t1,
+                                              unsigned long* t2, int n,
+                                              int shift, int x, int w)
+{
+    unsigned sc = ((unsigned)shift) & 31;
+    unsigned xc = ((unsigned)x) & 31;
+    unsigned long raw = 0;
+    int i = 0;
+    if (n <= 0)
+        return 0;
+    for (;;) {
+        unsigned long mixed, bound;
+        int b;
+        gca_rc_dec_normalize(d);
+        mixed = (t1[i] * (unsigned long)(4 - w) +
+                 t2[i] * (unsigned long)w) >> 2;
+        bound = (d->range >> 12) * mixed;
+        if (d->code < bound) {
+            unsigned long a, b2;
+            d->range = bound;
+            a = t1[i]; t1[i] = a + ((0x1000UL - a) >> sc);
+            b2 = t2[i]; t2[i] = b2 + ((0x1000UL - b2) >> xc);
+            b = 0;
+        } else {
+            unsigned long a, b2;
+            d->code = (d->code - bound) & 0xFFFFFFFFUL;
+            d->range = (d->range - bound) & 0xFFFFFFFFUL;
+            a = t1[i]; t1[i] = a - (a >> sc);
+            b2 = t2[i]; t2[i] = b2 - (b2 >> xc);
+            b = 1;
+        }
+        if (b)
+            break;
+        i++;
+        if (i >= n)
+            break;
+    }
+    if (i <= 1)
+        return (unsigned long)i;
+    {
+        int nb = i - 1;
+        while (nb > 0) {
+            unsigned long half;
+            gca_rc_dec_normalize(d);
+            half = d->range >> 1;
+            raw <<= 1;
+            if (d->code < half) {
+                d->range = half;
+            } else {
+                raw |= 1;
+                d->code = (d->code - half) & 0xFFFFFFFFUL;
+                d->range = (d->range - half) & 0xFFFFFFFFUL;
+            }
+            nb--;
+        }
+    }
+    return (1UL << ((unsigned long)(i - 1) & 31)) + raw;
+}
+
+int gca_var_decode(const unsigned char* in, size_t len, size_t total,
+                   unsigned long mode, gca_buf* out)
+{
+    unsigned long* t256, *t32, *t64k, *t8k;
+    unsigned char mtf[256];
+    gca_rc_dec d;
+    size_t produced = 0;
+    unsigned prev = 0;
+    unsigned useMtf, useRun, vSel, lSel, f12, lnShift, f4;
+    int i;
+
+    t256 = (unsigned long*)malloc(sizeof(unsigned long) * 256);
+    t32  = (unsigned long*)malloc(sizeof(unsigned long) * 32);
+    t64k = (unsigned long*)malloc(sizeof(unsigned long) * 65536);
+    t8k  = (unsigned long*)malloc(sizeof(unsigned long) * 8192);
+    if (!t256 || !t32 || !t64k || !t8k) {
+        free(t256); free(t32); free(t64k); free(t8k);
+        return -1;
+    }
+    useMtf   = (mode >> 28) & 1;
+    useRun   = (mode >> 24) & 1;
+    vSel     = (mode >> 20) & 0xF;
+    lSel     = (mode >> 16) & 0xF;
+    f12      = (mode >> 12) & 0xF;
+    lnShift  = (mode >> 8) & 0xF;
+    f4       = (mode >> 4) & 0xF;
+
+    if (vSel == 0 && lSel == 0) {
+        for (i = 0; i < 256; i++) t256[i] = 0x800;
+        for (i = 0; i < 32; i++) t32[i] = 0x800;
+    } else {
+        for (i = 0; i < 256; i++) t256[i] = 0x800;
+        for (i = 0; i < 32; i++) t32[i] = 0x800;
+        for (i = 0; i < 65536; i++) t64k[i] = 0x800;
+        for (i = 0; i < 8192; i++) t8k[i] = 0x800;
+    }
+    for (i = 0; i < 256; i++) mtf[i] = (unsigned char)i;
+
+    gca_rc_dec_init(&d, in, len, 0);
+    while (produced < total) {
+        unsigned long idx, run = 0, sym;
+        unsigned mi;
+        if (vSel == 0) {
+            idx = gca_rc_dec_tree(&d, t256, 1, 8, (int)f12);
+        } else if (vSel == 2) {
+            idx = gca_rc_dec_tree_mixed2(&d, t256,
+                                         t64k + ((prev & 0xFF) << 8), 1, 8,
+                                         (int)f12, (int)f4);
+        } else {
+            idx = gca_rc_dec_tree_mixed(&d, t256,
+                                        t64k + ((prev & 0xFF) << 8), 1, 8,
+                                        (int)f12, (int)f4, (int)vSel);
+        }
+        if (useRun) {
+            if (lSel)
+                run = gca_rc_dec_number_mixed(&d,
+                                              t8k + ((prev & 0xFF) << 5), t32,
+                                              32, (int)lnShift, (int)f4,
+                                              (int)lSel);
+            else
+                run = gca_rc_dec_number(&d, t32, 32, (int)lnShift);
+        }
+        mi = useRun ? ((idx + 1) & 0xFF) : (idx & 0xFF);
+        if (useMtf) {
+            unsigned k;
+            sym = mtf[mi];
+            for (k = mi; k > 0; k--)
+                mtf[k] = mtf[k - 1];
+            mtf[0] = (unsigned char)sym;
+        } else {
+            sym = idx & 0xFF;
+        }
+        if (useRun) {
+            unsigned long n = run + 1;
+            while (n > 0 && produced < total) {
+                gca_buf_putc(out, (int)sym);
+                produced++;
+                n--;
+            }
+        } else {
+            if (produced < total) {
+                gca_buf_putc(out, (int)sym);
+                produced++;
+            }
+        }
+        prev = sym;
+    }
+    free(t256); free(t32); free(t64k); free(t8k);
+    return 0;
+}
+
+/* ---------------------------------------------------------------- */
 /* Burrows-Wheeler transform                                         */
 int gca_bwt_encode(const unsigned char* in, size_t n, gca_buf* out,
                    unsigned long* prim)
@@ -667,6 +908,43 @@ int gca_frame_decode(const unsigned char* p, size_t avail, size_t* consumed,
             *consumed = 24 + s1 + s2;
             *orig = ex;
             rc = 0;
+        }
+        gca_buf_free(&bwt);
+        gca_buf_free(&lits);
+        gca_buf_free(&dec);
+        return rc;
+    }
+    if (avail >= 28 && memcmp(p, "GCF2", 4) == 0) {
+        unsigned long ex   = gca_rd32(p + 4);
+        unsigned long lit  = gca_rd32(p + 8);
+        unsigned long prim = gca_rd32(p + 12);
+        unsigned long s1   = gca_rd32(p + 16);
+        unsigned long s2   = gca_rd32(p + 20);
+        unsigned long mode = gca_rd32(p + 24);
+        gca_buf bwt, lits, dec;
+        int rc = -1;
+
+        if (28 + s1 + s2 > avail)
+            return -1;
+        gca_buf_init(&bwt);
+        gca_buf_init(&lits);
+        gca_buf_init(&dec);
+
+        if (gca_var_decode(p + 28, s1, lit, mode, &bwt) == 0 &&
+            gca_bwt_decode(bwt.data, bwt.len, prim, &lits) == 0) {
+            /* the encoder may have noised the literal stream */
+            if (mode & 0x80000000UL) {
+                size_t x;
+                for (x = 0; x < lits.len; x += 0x3FF)
+                    lits.data[x] ^= (unsigned char)(x & 0xFF);
+            }
+            if (gca_lz_decode(p + 28 + s1, s2, lits.data, lits.len, ex,
+                              &dec) == 0 && dec.len == ex) {
+                gca_buf_put(out, dec.data, dec.len);
+                *consumed = 28 + s1 + s2;
+                *orig = ex;
+                rc = 0;
+            }
         }
         gca_buf_free(&bwt);
         gca_buf_free(&lits);

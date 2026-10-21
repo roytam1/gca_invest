@@ -102,9 +102,9 @@ int main(int argc, char** argv)
     if (gca_arc_open(archive, spell, &arc) != 0) {
         if (arc.legacy) {
             fprintf(stderr,
-                "%s is a legacy GCA container (GCA0/GCA1/GCA3).\n"
-                "Those pre-0.9 layouts are only read by gcac.exe; this\n"
-                "tool handles the current GCAX container only.\n", archive);
+                "%s is a standalone GCA3 container.\n"
+                "That variant has no GCAX envelope and is not supported.\n",
+                archive);
         } else {
             fprintf(stderr, "cannot open %s%s\n", archive,
                     (spell || "") ? "" : " (encrypted archives need -p or -k)");
