@@ -8,10 +8,16 @@
 /////////////////////////////////////////////////////////////////
 #include "gca.h"
 #include <sys/stat.h>
+#include <time.h>
 
 #ifdef _WIN32
 #  define WIN32_LEAN_AND_MEAN
 #  include <windows.h>
+#  ifndef INVALID_FILE_ATTRIBUTES
+#    define INVALID_FILE_ATTRIBUTES ((DWORD)-1)
+#  endif
+#else
+#  include <utime.h>
 #endif
 
 #define GCA_BLOCK_SIZE 0x100000UL   /* the 1 MiB chunk size */
@@ -118,6 +124,10 @@ static int gca_read_dir_body(const unsigned char* body, size_t bodyLen,
         members[i].attr       = gca_rd32(e + 0x04);
         members[i].ft_lo      = gca_rd32(e + 0x08);
         members[i].ft_hi      = gca_rd32(e + 0x0C);
+        /* this build carries sizes in 32 bit words; a >4 GiB member is
+           not supported and must not be silently truncated */
+        if (gca_rd32(e + 0x14) != 0 || gca_rd32(e + 0x1C) != 0)
+            goto fail;
         members[i].orig_size  = gca_rd32(e + 0x10);
         members[i].stored_size = gca_rd32(e + 0x18);
         members[i].data_off   = 0;
@@ -202,6 +212,25 @@ static int gca_arc_open_legacy(gca_archive* arc, const unsigned char* image,
         goto done;
     if (start + hdr > len || hdr < 0x24)
         goto done;
+
+    /* The legacy layout has no documented password handling in our
+       fixtures.  gcac.exe tests bit 2 of the flag word; do not turn an
+       encrypted legacy directory into garbage member names. */
+    if (gca_rd32(image + start + 0x10) & 0x4) {
+        arc->legacy_encrypted = 1;
+        goto done;
+    }
+
+    /* The directory ends with four zero bytes and a CRC-32 over
+       everything before the CRC field. */
+    if (hdr >= 8 && gca_rd32(image + start + hdr - 8) == 0) {
+        unsigned long stored = gca_rd32(image + start + hdr - 4);
+        unsigned long calc = gca_crc32(image + start, (size_t)(hdr - 4), 0);
+        if (calc != stored) {
+            arc->crc_error = 1;
+            goto done;
+        }
+    }
 
     arc->members = (gca_member*)calloc(cnt, sizeof(gca_member));
     if (!arc->members)
@@ -357,9 +386,10 @@ static int gca_arc_decrypt(gca_archive* arc, const char* spell,
     numFiles  = gca_rd32(image + dirAbs + 0x18);
     if (blockSize < 0x20)
         return -1;
-    bodyLen = blockSize - 0x20;
-    if (dirAbs + 0x20 + bodyLen > arc->image_len)
+    if (dirAbs + 0x20 > arc->image_len ||
+        blockSize > arc->image_len - dirAbs)
         return -1;
+    bodyLen = blockSize - 0x20;
 
     plain = (unsigned char*)malloc(arc->image_len);
     if (!plain)
@@ -421,6 +451,8 @@ static int gca_arc_decrypt(gca_archive* arc, const char* spell,
             members[k].attr        = gca_rd32(e + 0x04);
             members[k].ft_lo       = gca_rd32(e + 0x08);
             members[k].ft_hi       = gca_rd32(e + 0x0C);
+            if (gca_rd32(e + 0x14) != 0 || gca_rd32(e + 0x1C) != 0)
+                goto fail;
             members[k].orig_size   = gca_rd32(e + 0x10);
             members[k].stored_size = gca_rd32(e + 0x18);
         }
@@ -489,13 +521,33 @@ fail:
     return -1;
 }
 
+/* CRC-32 over the directory header and the stored body.  `flags` is the
+   original flag word; for an encrypted archive the header copy in memory
+   has had the crypto bits cleared, so they are restored here. */
+static int gca_check_dir_crc(const unsigned char* hdr, unsigned long flags,
+                             const unsigned char* body, size_t bodyLen,
+                             unsigned long numFiles)
+{
+    unsigned char tmp[32];
+    unsigned long crc;
+    memcpy(tmp, hdr, 32);
+    gca_wr32(tmp + 0x04, flags);
+    gca_wr32(tmp + 0x10, 0);
+    gca_wr32(tmp + 0x14, 0);
+    gca_wr32(tmp + 0x18, numFiles);
+    gca_wr32(tmp + 0x1C, 0);
+    crc = gca_crc32(tmp, 32, 0);
+    crc = gca_crc32(body, bodyLen, crc);
+    return crc == gca_rd32(hdr + 0x14);
+}
+
 int gca_arc_open(const char* path, const char* spell, gca_archive* arc)
 {
     unsigned char* image = NULL;
     size_t image_len = 0;
     long start;
     size_t dirAbs, bodyLen, payloadOff, payloadLen, pos;
-    unsigned long flags, blockSize, numFiles;
+    unsigned long flags, orig_flags, blockSize, numFiles;
     const unsigned char* view;
     size_t view_len;
 
@@ -537,12 +589,13 @@ int gca_arc_open(const char* path, const char* spell, gca_archive* arc)
         goto fail;
 
     flags     = gca_rd32(image + dirAbs + 4);
+    orig_flags = flags;
     blockSize = gca_rd32(image + dirAbs + 8);
     if (blockSize < 0x20)
         goto fail;
-    bodyLen = blockSize - 0x20;
-    if (dirAbs + 0x20 + bodyLen > image_len)
+    if (blockSize > image_len - dirAbs)
         goto fail;
+    bodyLen = blockSize - 0x20;
 
     if (flags & (GCA_FLAG_CRYPTO | GCA_FLAG_DIRENCRYPTED)) {
         if (!spell || !*spell)
@@ -560,6 +613,11 @@ int gca_arc_open(const char* path, const char* spell, gca_archive* arc)
     numFiles = gca_rd32(view + dirAbs + 0x18);
     if (numFiles == 0 || numFiles > 100000)
         goto fail;
+    if (!gca_check_dir_crc(view + dirAbs, orig_flags, view + dirAbs + 0x20,
+                           bodyLen, numFiles)) {
+        arc->crc_error = 1;
+        goto fail;
+    }
     arc->members = (gca_member*)calloc(numFiles, sizeof(gca_member));
     if (!arc->members)
         goto fail;
@@ -629,9 +687,63 @@ static int gca_mkpath(const char* path)
     return 0;
 }
 
-static int gca_write_file(const char* path, const unsigned char* data, size_t len)
+static void gca_clear_attrs(const char* path)
 {
-    FILE* fp = fopen(path, "wb");
+#ifdef _WIN32
+    DWORD a = GetFileAttributesA(path);
+    if (a != INVALID_FILE_ATTRIBUTES && !(a & FILE_ATTRIBUTE_DIRECTORY))
+        SetFileAttributesA(path, FILE_ATTRIBUTE_NORMAL);
+#else
+    (void)path;
+#endif
+}
+
+static void gca_set_attrs(const char* path, unsigned long attr)
+{
+#ifdef _WIN32
+    if (attr)
+        SetFileAttributesA(path, attr);
+#else
+    (void)path;
+    (void)attr;
+#endif
+}
+
+static void gca_set_meta(const char* path, unsigned long attr,
+                         unsigned long ft_lo, unsigned long ft_hi)
+{
+#ifdef _WIN32
+    FILETIME ft;
+    HANDLE h;
+    ft.dwLowDateTime = ft_lo;
+    ft.dwHighDateTime = ft_hi;
+    h = CreateFileA(path, GENERIC_WRITE, 0, NULL, OPEN_EXISTING,
+                    FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h != INVALID_HANDLE_VALUE) {
+        SetFileTime(h, NULL, NULL, &ft);
+        CloseHandle(h);
+    }
+    if (attr)
+        SetFileAttributesA(path, attr);
+#else
+    if (ft_lo || ft_hi) {
+        double secs = ((double)ft_hi * 4294967296.0 + (double)ft_lo)
+                      / 10000000.0 - 11644473600.0;
+        struct utimbuf ut;
+        ut.actime = ut.modtime = (time_t)secs;
+        utime(path, &ut);
+    }
+    (void)attr;
+#endif
+}
+
+static int gca_write_file(const char* path, const unsigned char* data,
+                          size_t len, unsigned long attr,
+                          unsigned long ft_lo, unsigned long ft_hi)
+{
+    FILE* fp;
+    gca_clear_attrs(path);
+    fp = fopen(path, "wb");
     if (!fp)
         return -1;
     if (len && fwrite(data, 1, len, fp) != len) {
@@ -639,6 +751,7 @@ static int gca_write_file(const char* path, const unsigned char* data, size_t le
         return -1;
     }
     fclose(fp);
+    gca_set_meta(path, attr, ft_lo, ft_hi);
     return 0;
 }
 
@@ -673,6 +786,13 @@ int gca_arc_extract(gca_archive* arc, unsigned long index, const char* outdir)
             return -1;
         strcpy(path, m->name);
     }
+    /* a directory member: create it and stop here */
+    if (m->attr & 0x10) {
+        gca_mkpath(path);
+        gca_set_attrs(path, m->attr);
+        return 0;
+    }
+
     /* create the directories */
     {
         char tmp[1024];
@@ -740,10 +860,10 @@ int gca_arc_extract(gca_archive* arc, unsigned long index, const char* outdir)
 
     crc = gca_crc32(out.data, out.len, 0);
     if (crc != m->crc) {
-        fprintf(stderr, "warning: CRC mismatch for %s (%08lx != %08lx)\n",
-                m->name, crc, m->crc);
+        fprintf(stderr, "CRC Error  %s\n", path);
     }
-    if (gca_write_file(path, out.data, out.len) != 0) {
+    if (gca_write_file(path, out.data, out.len, m->attr,
+                       m->ft_lo, m->ft_hi) != 0) {
         gca_buf_free(&out);
         return -1;
     }
@@ -780,6 +900,8 @@ int gca_pack_add(gca_writer* w, const char* name,
 {
     gca_src* s;
     size_t n = strlen(name);
+    if (len > (size_t)0xFFFFFFFFUL)
+        return -1;              /* the format's 64 bit sizes are not used */
     if (w->nsrc == w->cap) {
         size_t cap = w->cap ? w->cap * 2 : 8;
         gca_src* p = (gca_src*)realloc(w->srcs, sizeof(gca_src) * cap);
