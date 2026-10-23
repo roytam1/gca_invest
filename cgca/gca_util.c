@@ -2,6 +2,41 @@
 // gca_util.c -- buffers, CRC-32, SHA-1 and little endian accessors.
 /////////////////////////////////////////////////////////////////
 #include "gca.h"
+#include <sys/stat.h>
+
+/* ---------------------------------------------------------------- */
+/* path helpers                                                      */
+int gca_path_exists(const char* path)
+{
+    struct stat st;
+    return path && stat(path, &st) == 0;
+}
+
+int gca_archive_path(const char* in, char* out, size_t cap)
+{
+    size_t n, i, sep = 0, cut;
+    if (!in || !out || cap == 0)
+        return -1;
+    n = strlen(in);
+    if (n + 5 > cap)
+        return -1;
+    for (i = 0; i < n; i++)
+        if (in[i] == '\\' || in[i] == '/')
+            sep = i + 1;
+    cut = n;
+    for (i = sep; i < n; i++)
+        if (in[i] == '.')
+            cut = i;
+    if (cut > sep && cut < n) {
+        memcpy(out, in, cut);
+        out[cut] = 0;
+    } else {
+        memcpy(out, in, n);
+        out[n] = 0;
+    }
+    strcat(out, ".gca");
+    return 0;
+}
 
 /* ---------------------------------------------------------------- */
 /* buffers                                                           */
