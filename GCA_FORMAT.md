@@ -24,6 +24,7 @@ gcac <command> [switches] <archive> <file or folder>
   l   list the contents of an archive
 
   -o<file>     order/list file: the members to archive, one per line
+  -d           keep the path of -o entries (default: store base names)
   -p<password> password for encryption
   -k<keyfile>  key file for encryption
 ```
@@ -35,7 +36,14 @@ Notes:
 * Only **one** source path per invocation unless `-o` supplies a list file.
   Entries of a list file are stored by their **base name** (the directory
   part is stripped), whereas a folder argument keeps the relative path
-  (`gcac a out.gca sub` stores `sub\inner.bin`).
+  (`gcac a out.gca sub` stores `sub\inner.bin`).  `-d` keeps the path of
+  list entries instead (a drive letter and leading separators are
+  stripped), and the paths are resolved from the current directory.
+* The extension of the archive argument is always replaced by `.gca`:
+  `gcac a tree` writes `tree.gca`, `gcac a foo.dat tree` writes `foo.gca`,
+  and `gcac e foo` looks for `foo.gca`. **[V]**
+* `n` disables directory compression as well as payload compression; `a`
+  and `s` compress the directory automatically when it pays off. **[V]**
 * `-k` is not a different cipher: the key file is hashed with SHA-1 and the
   lower case hex digest is used as the password.  `gcac a x.gca -k key.bin`
   is byte identical to `gcac a x.gca -p <sha1hex(key.bin)>`. **[V]**
@@ -139,6 +147,10 @@ against plain, solid and encrypted archives.
   payload region (the sum of its frames).  In solid archives it is 0 for
   every member. **[V]**
 * An empty file produces **no frame at all** and a stored size of 0. **[V]**
+* A directory with no children is a member of its own: `dwFileAttributes`
+  has bit `0x10` set, both sizes and the CRC are 0, and it has no frame.
+  Non-empty directories are **not** stored; only their files (and their
+  empty descendants) appear. **[V]**
 
 ### 2.4 Names block
 
@@ -161,6 +173,21 @@ GCF1 frame  -> the names block
 
 The 8 byte prefix is why the entry table appears at `GCA3 + 0x28` rather than
 `GCA3 + 0x20` in that case.
+
+### 2.6 Member order for a folder argument
+
+Reading does not depend on it, but archives are byte identical only when the
+member order matches.  For a folder, `gcac.exe` collects all files plus the
+leaf empty directories and sorts them by
+
+1. the extension of the **base name**, case-sensitively, with "no extension"
+   first (`noext` < `.aaa` < `.bin` < `.txt` < `.zzz`), then
+2. the base name, then
+3. the whole stored path.
+
+Non-empty directories contribute no entry of their own, but their files take
+part in the same global sort.  `-o` order lists are used exactly in the given
+order and are not sorted. **[V]**
 
 ---
 
@@ -203,6 +230,21 @@ followed by payload 1 then payload 2. **[V]**
 Identical to GCF1 plus a `mode` word at `+0x18` that selects the stage 1
 coders (MTF / RLE on/off, table mixing, adaptation shifts).  **[D]**
 
+`gcac.exe` chooses between GCF1 and GCF2 **per frame**.  It computes two
+statistics of the BWT output — the standard deviation of the 256 byte counts
+and the fraction of adjacent equal bytes — and a mode word from them and the
+literal count (`sub_40F2F0`).  The mode `0x11005600` means "use the plain
+GCF1 coder"; every other value is written as the GCF2 mode.  This is why a
+text block becomes GCF1 while a block with a large low-entropy literal stream
+becomes GCF2.  The encoder in `cgca/gca_codec.c` (`gca_choose_mode`) mirrors
+the original formula, including the exact mode words `0x203050` and
+`0x202040` seen from 0.9k. **[V]**
+
+For a periodic BWT input several rotations are identical.  The original
+reports the first rotation in a stable sort (smallest start index), which is
+what the C encoder does as well; this matters only for byte identity, not for
+decoding. **[V]**
+
 ### 4.4 Chunking
 
 The input is split into **1 MiB (0x100000) byte** blocks and every block
@@ -226,10 +268,17 @@ literal stream  +  LZ token stream
    v
 BWT string
    |
-   |  stage 1:  MTF + RLE, range coded over 12 bit probability tables
+   |  stage 1: MTF + RLE (GCF1), or the mode-selected coder (GCF2),
+   |           range coded over 12 bit probability tables
    v
 payload 1  (stage 1)          payload 2  (LZ tokens)
 ```
+
+Both stage 1 variants are implemented in both directions: `cgca` reproduces
+the GCF1/GCF2 choice and produces byte identical frames.  The legacy fixture
+`gcasdk_v09d.gca` exercises the GCF2 decoder with mode `0x00201030`; the
+0.9k encoder produced `0x203050` and `0x202040` in the corpus used here, and
+the same mode formula covers the other coder combinations.
 
 The BWT is applied to the **literal** stream, not to the whole file, and the
 LZ token stream is the *second* payload.  The decoder in `GcaSDK/` implements
@@ -442,6 +491,14 @@ path is not functional:
 reports it as an unsupported container.  A standalone GCA3 file is
 treated as an unknown format rather than a GCA archive.  **[V]**
 
+### 7.6 Encrypted legacy containers
+
+`gcac.exe` also reads `GCA0`/`GCA1` containers whose directory is
+encrypted (flag bit `0x04`).  The two fixtures in `fixtures/` are plain,
+and 0.9k cannot write these containers, so this path has no test sample.
+`cgca` marks such a container as unsupported instead of parsing the
+ciphertext as names.  The modern GCAX encryption is fully implemented.
+
 ---
 
 ## 8. Implementations in this repository
@@ -455,17 +512,24 @@ The C tools are interoperable with `gcac.exe` in both directions: archives
 created by `gcac_pack` are extracted correctly by `gcac.exe`, and archives
 created by `gcac.exe` are extracted correctly by `gcac_unpack`.  This was
 verified for the `a`/`s`/`n` commands, for plain, `-p` and `-k` encryption,
-and for single and multi member archives.  They also read the legacy
-`GCA0`/`GCA1` containers (§7).
+for single and multi member archives, for folder trees with nested and empty
+directories, and for solid archives.  With the same ordered member list the
+archives are **byte identical**, including folder archives.  The tools also
+read the legacy `GCA0`/`GCA1` containers (§7), restore file attributes and
+timestamps on extraction, and validate both the directory CRC and the legacy
+trailer CRC.
 
 ```
 cd cgca
 build.bat          (Visual C++ 6)   or   make   (anything else)
 build\gcac_pack.exe   out.gca  file.txt folder\
-build\gcac_unpack.exe out.gca -o dest
+build\gcac_pack.exe a out.gca folder          # gcac.exe style command
+build\gcac_pack.exe -o list.txt out.gca       # order list; -d keeps paths
+build\gcac_unpack.exe l out.gca               # list only
+build\gcac_unpack.exe e out.gca dest          # extract
 
-python roundtrip.py    # packs, extracts with gcac.exe and with the C
-                       # tools and compares everything byte for byte
+python roundtrip.py    # flat corpus, both directions, byte for byte
+python parity.py       # folders, empty dirs, attributes, CLI, byte equity
 ```
 
 ## 9. Reproducing / verifying
