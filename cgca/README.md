@@ -21,6 +21,7 @@
 //   python roundtrip.py       flat corpus, both directions, byte for byte
 //   python parity.py          folders, empty dirs, attributes, CLI
 //   python legacy.py          gcac_v09e fixtures, including encryption
+//   python legacy_write.py    gcac_pack -L, read back by every tool
 //
 // The format is documented in ../GCA_FORMAT.md.  Two legacy archives
 // (fixtures/ in the repository root) are used as test fixtures.
@@ -29,6 +30,7 @@
 //   -s         solid mode: every member shares one payload stream
 //   -n         no compression: payload and directory are stored verbatim
 //   -C         compress the directory block when it pays off (default)
+//   -L         write a legacy GCA0/GCA1 container (gcac_v09e layout)
 //   -o <file>  order list: one path per line (or -o<file>)
 //   -d         keep the directory part of -o entries (default: base name)
 //   -p <pw>    password for encryption (or -p<pw>)
@@ -64,4 +66,9 @@
 //     file is not supported: "GCA3" is the directory block magic, not
 //     a file container, and gcac.exe's own handling of that case is
 //     broken (see ../GCA_FORMAT.md section 7.5).
+//   * -L writes legacy GCA0 (normal) / GCA1 (solid) archives with the
+//     gcac_v09e layout; gcac.exe and gcac_v09e.exe read them.  The
+//     bytes are not identical to v09e output because v09e leaves two
+//     header/entry fields uninitialized; the meaningful fields and the
+//     CRC agree.  Legacy archives cannot store empty directories.
 ///////////////////////////////////////////////////////////////

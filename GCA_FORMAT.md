@@ -541,23 +541,40 @@ created by `gcac.exe` are extracted correctly by `gcac_unpack`.  This was
 verified for the `a`/`s`/`n` commands, for plain, `-p` and `-k` encryption,
 for single and multi member archives, for folder trees with nested and empty
 directories, and for solid archives.  With the same ordered member list the
-archives are **byte identical**, including folder archives.  The tools also
-read the legacy `GCA0`/`GCA1` containers (§7), restore file attributes and
-timestamps on extraction, and validate both the directory CRC and the legacy
-trailer CRC.
+modern archives are **byte identical**, including folder archives.
+
+`gcac_pack -L` writes legacy `GCA0`/`GCA1` archives.  They are read by
+`gcac.exe`, `gcac_v09e.exe`, `gcac_unpack` and `GcaSDK`, but are not byte
+identical to v09e output: v09e leaves the header `+0x18` marker and entry
+`+0x14` bytes uninitialized, while this writer uses fixed values.  The
+meaningful fields and the CRC agree.  Legacy archives cannot store empty
+directories.
+
+Both decoders (C and C++) handle the legacy containers, including the
+encrypted version 6, restore file attributes and timestamps, and validate
+both the modern directory CRC and the legacy trailer CRC.  `GcaSDK` also
+extracts directory members and solid archives whose first member is empty.
+
+`GcaSDK` is a decoder only.  Its remaining limits are the same as the C
+tools: a 32-bit/whole-file design (no streaming or >4 GiB members) and no
+standalone `GCA3` container.  It now covers the modern GCAX container, the
+legacy GCA0/GCA1 variants 2 and 3, plain and encrypted payloads, raw and
+GCF0/GCF1/GCF2 payloads, and directory members.
 
 ```
 cd cgca
 build.bat          (Visual C++ 6)   or   make   (anything else)
 build\gcac_pack.exe   out.gca  file.txt folder\
 build\gcac_pack.exe a out.gca folder          # gcac.exe style command
+build\gcac_pack.exe -L legacy.gca folder      # legacy GCA0/GCA1 output
 build\gcac_pack.exe -o list.txt out.gca       # order list; -d keeps paths
 build\gcac_unpack.exe l out.gca               # list only
 build\gcac_unpack.exe e out.gca dest          # extract
 
 python roundtrip.py    # flat corpus, both directions, byte for byte
 python parity.py       # folders, empty dirs, attributes, CLI, byte equity
-python legacy.py       # the gcac_v09e legacy fixtures, including encryption
+python legacy.py       # gcac_v09e fixtures, encryption, SDK and gcatest
+python legacy_write.py # gcac_pack -L, read back by gcac/v09e/SDK/cgca
 ```
 
 ## 9. Reproducing / verifying
@@ -568,7 +585,8 @@ build\gcatest.exe <archive.gca> [outdir] [spell]
 ```
 
 `spell` is the password (the raw `-p` text, or the lower case hex SHA-1 of the
-`-k` key file).  Without it, encrypted archives report `OPEN_FAILED`.
+`-k` key file).  Without it, encrypted archives report `OPEN_FAILED`.  The
+modern and legacy encrypted containers are both supported.
 
 The legacy archives in `fixtures/` are checked by `cgca/roundtrip.py` and
 `cgca/legacy.py`:
