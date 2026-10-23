@@ -195,12 +195,17 @@ fail:
 /*   +0x18 u64 FILETIME                                                 */
 /* ---------------------------------------------------------------- */
 static int gca_arc_open_legacy(gca_archive* arc, const unsigned char* image,
-                               size_t len, long start)
+                               size_t len, long start, const char* spell)
 {
-    unsigned long ver, cnt, hdr, i;
-    size_t eoff, namesPos;
-    gca_buf ents, names;
+    unsigned long ver, cnt, hdr, flags, i;
+    const unsigned char* view = image;
+    unsigned char* plain = NULL;
+    size_t eoff, namesPos, dirEnd, payloadOff, payloadLen, pos;
+    gca_buf ents, names, key;
+    gca_crypt ks;
     int rc = -1;
+    int encrypted = 0;
+    int variant3 = 0;
 
     gca_buf_init(&ents);
     gca_buf_init(&names);
@@ -212,44 +217,79 @@ static int gca_arc_open_legacy(gca_archive* arc, const unsigned char* image,
         goto done;
     if (start + hdr > len || hdr < 0x24)
         goto done;
+    dirEnd = (size_t)start + hdr;
 
-    /* The legacy layout has no documented password handling in our
-       fixtures.  gcac.exe tests bit 2 of the flag word; do not turn an
-       encrypted legacy directory into garbage member names. */
-    if (gca_rd32(image + start + 0x10) & 0x4) {
-        arc->legacy_encrypted = 1;
-        goto done;
+    if (ver == 6) {
+        /* encrypted legacy container: +0x10 .. hdr is encrypted with
+           password + "Header", the payload with the member name */
+        if (!spell || !*spell) {
+            arc->legacy_encrypted = 1;
+            goto done;
+        }
+        encrypted = 1;
+        plain = (unsigned char*)malloc(len);
+        if (!plain)
+            goto done;
+        memcpy(plain, image, len);
+        if (gca_key_dir(spell, &key) != 0)
+            goto done;
+        gca_crypt_setkey(&ks, key.data, key.len);
+        gca_buf_free(&key);
+        gca_crypt_xor(&ks, plain + start + 0x10, (size_t)(hdr - 0x10));
+        view = plain;
+        arc->plain = plain;
+        arc->plain_len = len;
+        plain = NULL;               /* owned by arc now */
+        flags = gca_rd32(view + start + 0x10);
+        variant3 = (hdr >= 0x18 && memcmp(view + start + 0x14, "GCF1", 4) == 0);
+    } else {
+        flags = gca_rd32(image + start + 0x10);
+        if (flags & 0x4) {          /* an older encrypted variant */
+            arc->legacy_encrypted = 1;
+            goto done;
+        }
+        variant3 = (ver == 3);
     }
 
     /* The directory ends with four zero bytes and a CRC-32 over
-       everything before the CRC field. */
-    if (hdr >= 8 && gca_rd32(image + start + hdr - 8) == 0) {
-        unsigned long stored = gca_rd32(image + start + hdr - 4);
-        unsigned long calc = gca_crc32(image + start, (size_t)(hdr - 4), 0);
+       everything before the CRC field.  For version 6 this covers the
+       decrypted bytes. */
+    if (hdr >= 8 && gca_rd32(view + start + hdr - 8) == 0) {
+        unsigned long stored = gca_rd32(view + start + hdr - 4);
+        unsigned long calc = gca_crc32(view + start, (size_t)(hdr - 4), 0);
         if (calc != stored) {
             arc->crc_error = 1;
             goto done;
         }
     }
 
+    arc->solid = (memcmp(image + start, "GCA1", 4) == 0);
+    arc->flags = flags;
+    /* variant 3 always frames its payload; in variant 2 bit 0 says the
+       payload is compressed (0 = the "n" command stored it raw) */
+    arc->rawPayload = variant3 ? 0 : ((flags & 1) ? 0 : 1);
+    arc->payload_off = dirEnd;
+    arc->payload_len = len - dirEnd;
+
     arc->members = (gca_member*)calloc(cnt, sizeof(gca_member));
     if (!arc->members)
         goto done;
+    arc->num_files = cnt;
 
-    if (ver == 3) {
+    if (variant3) {
         /* the directory is two GCF1 frames */
         size_t consumed, orig, p;
-        if (start + 0x14 + 24 > len)
+        if (start + 0x14 + 24 > dirEnd)
             goto done;
-        if (gca_frame_decode(image + start + 0x14, len - start - 0x14,
+        if (gca_frame_decode(view + start + 0x14, dirEnd - start - 0x14,
                              &consumed, &orig, &ents) != 0)
             goto done;
         if (ents.len != (size_t)(cnt * 32))
             goto done;
         p = (size_t)start + 0x14 + consumed;
-        if (p + 24 > len)
+        if (p + 24 > dirEnd)
             goto done;
-        if (gca_frame_decode(image + p, len - p, &consumed, &orig,
+        if (gca_frame_decode(view + p, dirEnd - p, &consumed, &orig,
                              &names) != 0)
             goto done;
         for (i = 0; i < cnt; i++) {
@@ -278,56 +318,85 @@ static int gca_arc_open_legacy(gca_archive* arc, const unsigned char* image,
             namesPos += n;
         }
     } else {
-        /* the plain directory */
+        /* Variant 2: the metadata (attributes and FILETIME) of member i
+           is at the start of entry i+1, while entry i carries the CRC and
+           sizes of member i+1.  The first member's data is in the header
+           and its metadata is in the first entry; the last member's
+           metadata is the 12 byte record before the names. */
         eoff = (size_t)start + 0x24;
-        if (eoff + 32 * (cnt - 1) + 12 > len)
+        if (eoff + 32 * (cnt - 1) + 12 > dirEnd)
             goto done;
-        for (i = 1; i < cnt; i++) {
-            const unsigned char* e = image + eoff + 32 * (i - 1);
-            gca_member* m = &arc->members[i];
-            m->ft_lo       = gca_rd32(e + 0x04);
-            m->ft_hi       = gca_rd32(e + 0x08);
-            m->attr        = gca_rd32(e + 0x0C);
-            m->crc         = gca_rd32(e + 0x10);
-            m->stored_size = gca_rd32(e + 0x18);
-            m->orig_size   = gca_rd32(e + 0x1C);
+        for (i = 0; i + 1 < cnt; i++) {
+            const unsigned char* e = view + eoff + 32 * i;
+            arc->members[i].attr    = gca_rd32(e + 0x00);
+            arc->members[i].ft_lo   = gca_rd32(e + 0x04);
+            arc->members[i].ft_hi   = gca_rd32(e + 0x08);
+            arc->members[i + 1].crc         = gca_rd32(e + 0x10);
+            arc->members[i + 1].stored_size = gca_rd32(e + 0x18);
+            arc->members[i + 1].orig_size   = gca_rd32(e + 0x1C);
         }
         eoff += 32 * (cnt - 1);
-        arc->members[0].ft_lo = gca_rd32(image + eoff + 4);
-        arc->members[0].ft_hi = gca_rd32(image + eoff + 8);
-        eoff += 12;
-        namesPos = eoff;
+        arc->members[cnt - 1].attr  = gca_rd32(view + eoff + 0);
+        arc->members[cnt - 1].ft_lo = gca_rd32(view + eoff + 4);
+        arc->members[cnt - 1].ft_hi = gca_rd32(view + eoff + 8);
+        namesPos = eoff + 12;
         for (i = 0; i < cnt; i++) {
             unsigned long n;
-            if (namesPos >= len)
+            if (namesPos >= dirEnd)
                 goto done;
-            n = image[namesPos++];
-            if (n == 0 || namesPos + n > len)
+            n = view[namesPos++];
+            if (n == 0 || namesPos + n > dirEnd)
                 goto done;
             arc->members[i].name = (char*)malloc(n + 1);
             if (!arc->members[i].name)
                 goto done;
-            memcpy(arc->members[i].name, image + namesPos, n);
+            memcpy(arc->members[i].name, view + namesPos, n);
             arc->members[i].name[n] = '\0';
             namesPos += n;
         }
         /* the first member's sizes and CRC live in the header */
-        arc->members[0].crc         = gca_rd32(image + start + 0x14);
-        arc->members[0].stored_size = gca_rd32(image + start + 0x1C);
-        arc->members[0].orig_size   = gca_rd32(image + start + 0x20);
+        arc->members[0].crc         = gca_rd32(view + start + 0x14);
+        arc->members[0].stored_size = gca_rd32(view + start + 0x1C);
+        arc->members[0].orig_size   = gca_rd32(view + start + 0x20);
     }
 
-    /* the payload region */
-    arc->payload_off = (size_t)start + hdr;
-    arc->payload_len = len - arc->payload_off;
+    payloadOff = arc->payload_off;
+    payloadLen = arc->payload_len;
+
+    /* decrypt the payload after the names are known */
+    if (encrypted) {
+        if (arc->solid) {
+            if (gca_key_solid(spell, &key) != 0)
+                goto done;
+            gca_crypt_setkey(&ks, key.data, key.len);
+            gca_buf_free(&key);
+            gca_crypt_xor(&ks, (unsigned char*)view + payloadOff, payloadLen);
+        } else {
+            pos = payloadOff;
+            for (i = 0; i < cnt; i++) {
+                unsigned long stored = arc->members[i].stored_size;
+                if (gca_key_payload(spell, arc->members[i].name, &key) != 0)
+                    goto done;
+                gca_crypt_setkey(&ks, key.data, key.len);
+                gca_buf_free(&key);
+                if (stored) {
+                    if (pos + stored > len)
+                        goto done;
+                    gca_crypt_xor(&ks, (unsigned char*)view + pos, stored);
+                }
+                pos += stored;
+            }
+        }
+    }
+
     if (arc->solid) {
         /* GCA1: one stream shared by every member */
         for (i = 0; i < cnt; i++) {
-            arc->members[i].data_off = (unsigned long)arc->payload_off;
-            arc->members[i].stored_size = (unsigned long)arc->payload_len;
+            arc->members[i].data_off = (unsigned long)payloadOff;
+            arc->members[i].stored_size = (unsigned long)payloadLen;
         }
     } else {
-        size_t pos = arc->payload_off;
+        pos = payloadOff;
         for (i = 0; i < cnt; i++) {
             arc->members[i].data_off = (unsigned long)pos;
             pos += arc->members[i].stored_size;
@@ -335,12 +404,11 @@ static int gca_arc_open_legacy(gca_archive* arc, const unsigned char* image,
                 goto done;
         }
     }
-    arc->num_files = cnt;
-    arc->flags = gca_rd32(image + start + 16);
-    arc->rawPayload = 0;
     rc = 0;
 
 done:
+    if (plain)
+        free(plain);
     gca_buf_free(&ents);
     gca_buf_free(&names);
     if (rc != 0)
@@ -569,7 +637,7 @@ int gca_arc_open(const char* path, const char* spell, gca_archive* arc)
                 arc->legacy = 1;
             goto fail;
         }
-        if (gca_arc_open_legacy(arc, image, image_len, 0) != 0)
+        if (gca_arc_open_legacy(arc, image, image_len, 0, spell) != 0)
             goto fail;
         return 0;
     }
@@ -810,7 +878,9 @@ int gca_arc_extract(gca_archive* arc, unsigned long index, const char* outdir)
         gca_buf whole;
         size_t pos = 0, i;
         gca_buf_init(&whole);
-        {
+        if (arc->rawPayload) {
+            gca_buf_put(&whole, view + arc->payload_off, arc->payload_len);
+        } else {
             gca_member* f = &arc->members[0];
             size_t consumed, orig;
             size_t p = f->data_off;

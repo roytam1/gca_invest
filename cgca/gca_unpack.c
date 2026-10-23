@@ -256,7 +256,7 @@ int main(int argc, char** argv)
         } else if (arc.legacy_encrypted) {
             fprintf(stderr,
                 "%s is an encrypted legacy GCA0/GCA1 container.\n"
-                "That variant is not supported by this build.\n",
+                "Use -p or -k to decode it.\n",
                 archive);
         } else if (arc.legacy) {
             fprintf(stderr,
