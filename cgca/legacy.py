@@ -8,6 +8,7 @@ variants, the non-compressed mode and encrypted normal/solid archives.
 
 Set GCAX_NO_GCAC=1 to test only the C tools.
 """
+import hashlib
 import os
 import shutil
 import subprocess
@@ -21,6 +22,8 @@ UNPACK = os.path.join(HERE, "build", "gcac_unpack.exe")
 FIXTURES = os.path.join(ROOT, "fixtures")
 GCAC = os.environ.get("GCAC", os.path.join(ROOT, "gcac.exe"))
 HAVE_GCAC = os.path.exists(GCAC) and not os.environ.get("GCAX_NO_GCAC")
+SDK = os.path.join(ROOT, "build", "gcatest.exe")
+HAVE_SDK = os.path.exists(SDK)
 IS_WIN = os.name == "nt"
 
 CASES = [
@@ -112,6 +115,14 @@ def main():
             rc, _, _ = sh(args)
             check("gcac.exe agrees on %s" % name,
                   rc == 0 and tree(outg) == t)
+        if HAVE_SDK:
+            outs = os.path.join(tmp, name[:-4] + "_sdk")
+            args = [SDK, src, outs]
+            if password:
+                args += [password]
+            rc, _, _ = sh(args)
+            check("GcaSDK agrees on %s" % name,
+                  rc == 0 and tree(outs) == t)
 
     # key-file encryption (the key is SHA-1 hashed like -p)
     src = os.path.join(FIXTURES, "gcacv09e_encrypted_key.gca")
@@ -125,6 +136,12 @@ def main():
         rc, _, _ = sh([GCAC, "e", src, outg, "-k", keyfile])
         check("gcac.exe agrees on gcacv09e_encrypted_key.gca",
               rc == 0 and tree(outg) == reference)
+    if HAVE_SDK:
+        outs = os.path.join(tmp, "keyfile_sdk")
+        spell = hashlib.sha1(open(keyfile, "rb").read()).hexdigest()
+        rc, _, _ = sh([SDK, src, outs, spell])
+        check("GcaSDK agrees on gcacv09e_encrypted_key.gca",
+              rc == 0 and reference is not None and tree(outs) == reference)
 
     # encrypted archives must not be silently parsed without a password
     rc, _, _ = sh([UNPACK, "l", os.path.join(FIXTURES,

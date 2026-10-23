@@ -31,6 +31,8 @@ PACK = os.path.join(HERE, "build", "gcac_pack.exe")
 UNPACK = os.path.join(HERE, "build", "gcac_unpack.exe")
 GCAC = os.environ.get("GCAC", os.path.join(ROOT, "gcac.exe"))
 HAVE_GCAC = os.path.exists(GCAC) and not os.environ.get("GCAX_NO_GCAC")
+SDK = os.path.join(ROOT, "build", "gcatest.exe")
+HAVE_SDK = os.path.exists(SDK)
 IS_WIN = os.name == "nt"
 
 
@@ -144,6 +146,12 @@ def main():
             check("we extract gcac.exe's %s archive" % tag,
                   rc == 0 and meta(os.path.join(out_o, "tree")) ==
                   meta(tree))
+            if HAVE_SDK:
+                out_s = os.path.join(tmp, "xs_%s" % tag)
+                rc, _, _ = sh([SDK, arc_o, out_s])
+                check("GcaSDK extracts our %s archive" % tag,
+                      rc == 0 and meta(os.path.join(out_s, "tree")) ==
+                      meta(tree))
             if IS_WIN:
                 em = meta(os.path.join(out_o, "tree"))
                 check("%s attributes survive" % tag,
@@ -165,6 +173,14 @@ def main():
             check("pack %s" % tag, rc == 0)
             check("%s archive is byte identical" % tag,
                   open(arc_g, "rb").read() == open(arc_o, "rb").read())
+            if HAVE_SDK:
+                spell = ("secret" if tag == "p" else
+                         hashlib.sha1(open(keyfile, "rb").read()).hexdigest())
+                out_s = os.path.join(tmp, "xs_%s" % tag)
+                rc, _, _ = sh([SDK, arc_o, out_s, spell])
+                check("GcaSDK extracts encrypted %s archive" % tag,
+                      rc == 0 and meta(os.path.join(out_s, "tree")) ==
+                      meta(tree))
 
         # -o order list, with and without -d
         lst = os.path.join(tmp, "list.txt")
