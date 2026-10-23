@@ -11,7 +11,7 @@ CC      ?= cc
 CFLAGS  ?= -O2 -Wall -Wextra -Wno-unused-parameter
 CPPFLAGS ?= -I.
 LDFLAGS ?=
-LDLIBS  ?=
+LDLIBS  ?= -lm
 
 COMMON  = gca_util.o gca_crypt.o gca_codec.o gca_arc.o
 

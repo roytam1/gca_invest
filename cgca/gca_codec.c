@@ -11,6 +11,12 @@
 //   sub_410410               frame writer
 /////////////////////////////////////////////////////////////////
 #include "gca.h"
+#include <math.h>
+
+/* Sanity limit for one decoded frame.  Payload blocks are 1 MiB; the
+   1/8 MiB directory frames are far below this as well.  It exists only
+   so that a corrupt header cannot ask the decoder to loop for hours. */
+#define GCA_MAX_FRAME (256UL * 1024UL * 1024UL)
 
 /* ---------------------------------------------------------------- */
 /* range decoder                                                     */
@@ -36,6 +42,10 @@ void gca_rc_dec_init(gca_rc_dec* d, const unsigned char* data, size_t len,
 
 void gca_rc_dec_normalize(gca_rc_dec* d)
 {
+    /* A corrupt stream can drive the range to zero.  Without this the
+       loop below would never terminate. */
+    if (d->range == 0)
+        d->range = 1;
     while (d->range <= 0x800000UL) {
         unsigned b = 0;
         d->code = (((d->code << 1) | (d->buf & 1)) << 7) & 0xFFFFFFFFUL;
@@ -505,6 +515,170 @@ static unsigned long gca_rc_dec_number_mixed(gca_rc_dec* d, unsigned long* t1,
     return (1UL << ((unsigned long)(i - 1) & 31)) + raw;
 }
 
+/* ---------------------------------------------------------------- */
+/* the variable stage 1 encoder (GCF2)                               */
+/* The model updates below mirror gca_var_decode exactly.            */
+static void gca_rc_enc_tree_mixed(gca_rc_enc* e, unsigned long* t1,
+                                  unsigned long* t2, int node,
+                                  unsigned long value, int nbits,
+                                  int shift, int x, int w)
+{
+    unsigned sc = ((unsigned)shift) & 31;
+    unsigned xc = ((unsigned)x) & 31;
+    int i;
+    for (i = nbits - 1; i >= 0; i--) {
+        int b = (int)((value >> i) & 1);
+        unsigned long mixed = (t1[node] * (unsigned long)(4 - w) +
+                               t2[node] * (unsigned long)w) >> 2;
+        gca_rc_enc_bit(e, mixed, b);
+        if (b) {
+            t1[node] -= t1[node] >> sc;
+            t2[node] -= t2[node] >> xc;
+        } else {
+            t1[node] += (0x1000UL - t1[node]) >> sc;
+            t2[node] += (0x1000UL - t2[node]) >> xc;
+        }
+        node = b + 2 * node;
+    }
+}
+
+static void gca_rc_enc_tree_mixed2(gca_rc_enc* e, unsigned long* t1,
+                                   unsigned long* t2, int node,
+                                   unsigned long value, int nbits,
+                                   int shift, int x)
+{
+    unsigned sc = ((unsigned)shift) & 31;
+    unsigned xc = ((unsigned)x) & 31;
+    int i;
+    for (i = nbits - 1; i >= 0; i--) {
+        int b = (int)((value >> i) & 1);
+        unsigned long mixed = (t1[node] + t2[node]) >> 1;
+        gca_rc_enc_bit(e, mixed, b);
+        if (b) {
+            t1[node] -= t1[node] >> sc;
+            t2[node] -= t2[node] >> xc;
+        } else {
+            t1[node] += (0x1000UL - t1[node]) >> sc;
+            t2[node] += (0x1000UL - t2[node]) >> xc;
+        }
+        node = b + 2 * node;
+    }
+}
+
+static void gca_rc_enc_number_mixed(gca_rc_enc* e, unsigned long* t1,
+                                    unsigned long* t2, unsigned long value,
+                                    int nbits, int shift, int x, int w)
+{
+    unsigned sc = ((unsigned)shift) & 31;
+    unsigned xc = ((unsigned)x) & 31;
+    int i = 0;
+    while ((value >> i) != 0) {
+        unsigned long mixed = (t1[i] * (unsigned long)(4 - w) +
+                               t2[i] * (unsigned long)w) >> 2;
+        gca_rc_enc_bit(e, mixed, 0);
+        t1[i] += (0x1000UL - t1[i]) >> sc;
+        t2[i] += (0x1000UL - t2[i]) >> xc;
+        i++;
+        if (i >= nbits)
+            return;
+    }
+    {
+        unsigned long mixed = (t1[i] * (unsigned long)(4 - w) +
+                               t2[i] * (unsigned long)w) >> 2;
+        gca_rc_enc_bit(e, mixed, 1);
+        t1[i] -= t1[i] >> sc;
+        t2[i] -= t2[i] >> xc;
+    }
+    if (i > 1)
+        gca_rc_enc_rawbits(e, i - 1, value & ((1UL << (i - 1)) - 1));
+}
+
+int gca_var_encode(const unsigned char* in, size_t len, gca_buf* out,
+                   unsigned long mode)
+{
+    unsigned long* t256, *t32, *t64k, *t8k;
+    unsigned char mtf[256];
+    gca_rc_enc e;
+    size_t pos = 0;
+    unsigned prev = 0;
+    unsigned useMtf, useRun, vSel, lSel, f12, lnShift, f4;
+    int i;
+
+    t256 = (unsigned long*)malloc(sizeof(unsigned long) * 256);
+    t32  = (unsigned long*)malloc(sizeof(unsigned long) * 32);
+    t64k = (unsigned long*)malloc(sizeof(unsigned long) * 65536);
+    t8k  = (unsigned long*)malloc(sizeof(unsigned long) * 8192);
+    if (!t256 || !t32 || !t64k || !t8k) {
+        free(t256); free(t32); free(t64k); free(t8k);
+        return -1;
+    }
+    useMtf   = (mode >> 28) & 1;
+    useRun   = (mode >> 24) & 1;
+    vSel     = (mode >> 20) & 0xF;
+    lSel     = (mode >> 16) & 0xF;
+    f12      = (mode >> 12) & 0xF;
+    lnShift  = (mode >> 8) & 0xF;
+    f4       = (mode >> 4) & 0xF;
+
+    for (i = 0; i < 256; i++) t256[i] = 0x800;
+    for (i = 0; i < 32; i++) t32[i] = 0x800;
+    if (vSel != 0 || lSel != 0) {
+        for (i = 0; i < 65536; i++) t64k[i] = 0x800;
+        for (i = 0; i < 8192; i++) t8k[i] = 0x800;
+    }
+    for (i = 0; i < 256; i++) mtf[i] = (unsigned char)i;
+
+    gca_rc_enc_init(&e, out);
+    while (pos < len) {
+        unsigned long sym = in[pos];
+        unsigned long run = 0;
+        unsigned long idx;
+
+        if (useRun) {
+            while (pos + run + 1 < len && in[pos + run + 1] == sym)
+                run++;
+        }
+        if (useMtf) {
+            unsigned long k = 0;
+            while (mtf[k] != (unsigned char)sym)
+                k++;
+            idx = useRun ? ((k - 1) & 0xFF) : k;
+            while (k > 0) {
+                mtf[k] = mtf[k - 1];
+                k--;
+            }
+            mtf[0] = (unsigned char)sym;
+        } else {
+            idx = sym & 0xFF;
+        }
+
+        if (vSel == 0)
+            gca_rc_enc_tree(&e, t256, 1, idx, 8, (int)f12);
+        else if (vSel == 2)
+            gca_rc_enc_tree_mixed2(&e, t256,
+                                   t64k + ((prev & 0xFF) << 8), 1, idx, 8,
+                                   (int)f12, (int)f4);
+        else
+            gca_rc_enc_tree_mixed(&e, t256,
+                                  t64k + ((prev & 0xFF) << 8), 1, idx, 8,
+                                  (int)f12, (int)f4, (int)vSel);
+
+        if (useRun) {
+            if (lSel)
+                gca_rc_enc_number_mixed(&e, t8k + ((prev & 0xFF) << 5),
+                                        t32, run, 32, (int)lnShift,
+                                        (int)f4, (int)lSel);
+            else
+                gca_rc_enc_number(&e, t32, run, 32, (int)lnShift);
+        }
+        pos += useRun ? (run + 1) : 1;
+        prev = (unsigned)sym;
+    }
+    gca_rc_enc_flush(&e);
+    free(t256); free(t32); free(t64k); free(t8k);
+    return 0;
+}
+
 int gca_var_decode(const unsigned char* in, size_t len, size_t total,
                    unsigned long mode, gca_buf* out)
 {
@@ -598,11 +772,19 @@ int gca_var_decode(const unsigned char* in, size_t len, size_t total,
 
 /* ---------------------------------------------------------------- */
 /* Burrows-Wheeler transform                                         */
+static int gca_cmp_ulong(const void* a, const void* b)
+{
+    unsigned long x = *(const unsigned long*)a;
+    unsigned long y = *(const unsigned long*)b;
+    return x < y ? -1 : (x > y ? 1 : 0);
+}
+
 int gca_bwt_encode(const unsigned char* in, size_t n, gca_buf* out,
                    unsigned long* prim)
 {
     unsigned long *p, *pn, *c, *cn, *cnt;
     size_t i, k;
+    int found = 0;
 
     *prim = 0;
     if (n == 0)
@@ -659,14 +841,31 @@ int gca_bwt_encode(const unsigned char* in, size_t n, gca_buf* out,
         { unsigned long* t = c; c = cn; cn = t; }
     }
 
+    /* Identical rotations have the same class but no defined order in
+       the doubling sort.  gcac.exe's merge sort is stable and keeps the
+       smaller rotation start first; do the same so the primary index
+       matches. */
+    {
+        size_t s = 0;
+        while (s < n) {
+            size_t e = s + 1;
+            unsigned long cls = c[p[s]];
+            while (e < n && c[p[e]] == cls)
+                e++;
+            if (e - s > 1)
+                qsort(p + s, e - s, sizeof(unsigned long), gca_cmp_ulong);
+            s = e;
+        }
+    }
     for (i = 0; i < n; i++) {
         unsigned long idx = p[i];
         unsigned long prev = (idx == 0) ? (unsigned long)(n - 1) : idx - 1;
         gca_buf_putc(out, in[prev]);
-        if (idx == 0)
+        if (idx == 0 && !found) {
             *prim = (unsigned long)i;
+            found = 1;
+        }
     }
-
     free(p); free(pn); free(c); free(cn); free(cnt);
     return 0;
 }
@@ -681,6 +880,8 @@ int gca_bwt_decode(const unsigned char* in, size_t n, unsigned long prim,
 
     if (n == 0)
         return 0;
+    if (prim >= n)
+        return -1;
     tmp = (unsigned long*)malloc(sizeof(unsigned long) * n);
     if (!tmp)
         return -1;
@@ -822,12 +1023,51 @@ int gca_lz_decode(const unsigned char* stream, size_t len,
 }
 
 /* ---------------------------------------------------------------- */
-/* frames                                                            */
+/* the frame writer chooses GCF1 or GCF2 from the statistics of the
+ * BWT output, exactly like gcac.exe sub_40F2F0.  GCF1 is requested by
+ * the special mode 0x11005600. */
+static unsigned long gca_choose_mode(double a1, double a2, size_t n)
+{
+    int v3 = 0, v4 = 0, v5 = 2, v6 = 0, v7 = 2, v8 = 4;
+    double v10;
+
+    if (a2 < 0.2) {
+        v7 = 3;
+        v8 = 5;
+    }
+    if (a2 > 0.7) {
+        v7 = 1;
+        v8 = 3;
+        if (a1 > 7.0)
+            v5 = 3;
+    }
+    v10 = a2 - (log((double)(n ? n : 1)) / log(2.0) - 17.0) * 0.1;
+    if ((a1 < 4.0 && v10 > 0.6) ||
+        (a1 >= 4.0 && (v10 - 0.2) * 10.0 > a1)) {
+        v4 = 1;
+        v5 = 0;
+        v3 = 1;
+        v7 = 5;
+        v8 = 0;
+        v6 = 6;
+    }
+    return ((unsigned long)v3 << 28) | ((unsigned long)v4 << 24) |
+           ((unsigned long)v5 << 20) | ((unsigned long)v7 << 12) |
+           ((unsigned long)v6 << 8) | ((unsigned long)v8 << 4);
+}
+
 int gca_frame_write(gca_buf* out, const unsigned char* in, size_t n)
 {
     gca_buf lits, stream, bwt, s1;
     unsigned long prim = 0;
+    unsigned long mode;
+    unsigned long counts[256];
     size_t frame_len;
+    size_t i;
+    unsigned long same = 0;
+    unsigned prev = 0;
+    double a1 = 0.0, a2 = 0.0;
+    int hdr;
 
     gca_buf_init(&lits);
     gca_buf_init(&stream);
@@ -844,25 +1084,65 @@ int gca_frame_write(gca_buf* out, const unsigned char* in, size_t n)
         gca_buf_free(&bwt); gca_buf_free(&s1);
         return -1;
     }
-    if (gca_stage1_encode(bwt.data, bwt.len, &s1) != 0) {
-        gca_buf_free(&lits); gca_buf_free(&stream);
-        gca_buf_free(&bwt); gca_buf_free(&s1);
-        return -1;
+
+    for (i = 0; i < 256; i++)
+        counts[i] = 0;
+    for (i = 0; i < bwt.len; i++) {
+        counts[bwt.data[i]]++;
+        if (bwt.data[i] == prev)
+            same++;
+        prev = bwt.data[i];
+    }
+    if (bwt.len) {
+        double sum = 0.0;
+        for (i = 0; i < 256; i++) {
+            double x = (double)counts[i] * 256.0 / (double)bwt.len - 1.0;
+            sum += x * x;
+        }
+        a1 = sqrt(sum * 0.00392156862745098);
+        a2 = (double)same / (double)bwt.len;
+    }
+    mode = gca_choose_mode(a1, a2, bwt.len);
+
+    if (mode == 0x11005600UL) {
+        hdr = 24;
+        if (gca_stage1_encode(bwt.data, bwt.len, &s1) != 0) {
+            gca_buf_free(&lits); gca_buf_free(&stream);
+            gca_buf_free(&bwt); gca_buf_free(&s1);
+            return -1;
+        }
+    } else {
+        hdr = 28;
+        if (gca_var_encode(bwt.data, bwt.len, &s1, mode) != 0) {
+            gca_buf_free(&lits); gca_buf_free(&stream);
+            gca_buf_free(&bwt); gca_buf_free(&s1);
+            return -1;
+        }
     }
 
-    frame_len = 24 + s1.len + stream.len;
+    frame_len = (size_t)hdr + s1.len + stream.len;
     if (n <= 8 || frame_len >= n + 8) {
         /* compression did not pay off: store the block */
         gca_buf_puts(out, "GCF0");
         gca_buf_put32(out, (unsigned long)n);
         gca_buf_put(out, in, n);
-    } else {
+    } else if (hdr == 24) {
         gca_buf_puts(out, "GCF1");
         gca_buf_put32(out, (unsigned long)n);          /* original size   */
         gca_buf_put32(out, (unsigned long)lits.len);   /* literal count   */
         gca_buf_put32(out, prim);                     /* BWT primary     */
         gca_buf_put32(out, (unsigned long)s1.len);    /* stage 1 length  */
         gca_buf_put32(out, (unsigned long)stream.len);/* LZ stream length*/
+        gca_buf_put(out, s1.data, s1.len);
+        gca_buf_put(out, stream.data, stream.len);
+    } else {
+        gca_buf_puts(out, "GCF2");
+        gca_buf_put32(out, (unsigned long)n);          /* original size   */
+        gca_buf_put32(out, (unsigned long)lits.len);   /* literal count   */
+        gca_buf_put32(out, prim);                     /* BWT primary     */
+        gca_buf_put32(out, (unsigned long)s1.len);    /* stage 1 length  */
+        gca_buf_put32(out, (unsigned long)stream.len);/* LZ stream length*/
+        gca_buf_put32(out, mode);                     /* coder selection */
         gca_buf_put(out, s1.data, s1.len);
         gca_buf_put(out, stream.data, stream.len);
     }
@@ -879,7 +1159,7 @@ int gca_frame_decode(const unsigned char* p, size_t avail, size_t* consumed,
         return -1;
     if (memcmp(p, "GCF0", 4) == 0) {
         unsigned long n = gca_rd32(p + 4);
-        if (8 + n > avail)
+        if (n > avail - 8)
             return -1;
         *consumed = 8 + n;
         *orig = n;
@@ -894,13 +1174,18 @@ int gca_frame_decode(const unsigned char* p, size_t avail, size_t* consumed,
         gca_buf bwt, lits, dec;
         int rc = -1;
 
-        if (24 + s1 + s2 > avail)
+        if (ex > GCA_MAX_FRAME || lit > GCA_MAX_FRAME || lit > ex)
+            return -1;
+        if (lit && prim >= lit)
+            return -1;
+        if (s1 > avail - 24 || s2 > avail - 24 - s1)
             return -1;
         gca_buf_init(&bwt);
         gca_buf_init(&lits);
         gca_buf_init(&dec);
 
         if (gca_stage1_decode(p + 24, s1, lit, &bwt) == 0 &&
+            bwt.len == lit &&
             gca_bwt_decode(bwt.data, bwt.len, prim, &lits) == 0 &&
             gca_lz_decode(p + 24 + s1, s2, lits.data, lits.len, ex, &dec) == 0 &&
             dec.len == ex) {
@@ -924,13 +1209,18 @@ int gca_frame_decode(const unsigned char* p, size_t avail, size_t* consumed,
         gca_buf bwt, lits, dec;
         int rc = -1;
 
-        if (28 + s1 + s2 > avail)
+        if (ex > GCA_MAX_FRAME || lit > GCA_MAX_FRAME || lit > ex)
+            return -1;
+        if (lit && prim >= lit)
+            return -1;
+        if (s1 > avail - 28 || s2 > avail - 28 - s1)
             return -1;
         gca_buf_init(&bwt);
         gca_buf_init(&lits);
         gca_buf_init(&dec);
 
         if (gca_var_decode(p + 28, s1, lit, mode, &bwt) == 0 &&
+            bwt.len == lit &&
             gca_bwt_decode(bwt.data, bwt.len, prim, &lits) == 0) {
             /* the encoder may have noised the literal stream */
             if (mode & 0x80000000UL) {

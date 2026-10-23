@@ -50,6 +50,12 @@ void gca_sha1(const unsigned char* data, size_t len,
 void gca_sha1_hex(const unsigned char* data, size_t len, char* out41);
 
 /* ---------------------------------------------------------------- */
+/* path helpers                                                      */
+int  gca_path_exists(const char* path);
+/* Turn "foo", "foo.bar" or "dir/foo.bar" into "foo.gca" / "dir/foo.gca". */
+int  gca_archive_path(const char* in, char* out, size_t cap);
+
+/* ---------------------------------------------------------------- */
 /* the "GflGCACryptograph" keystream                                */
 typedef struct {
     unsigned long state[624];
@@ -117,6 +123,8 @@ int gca_stage1_decode(const unsigned char* in, size_t len, size_t total,
    documented in GCA_FORMAT.md. */
 int gca_var_decode(const unsigned char* in, size_t len, size_t total,
                    unsigned long mode, gca_buf* out);
+int gca_var_encode(const unsigned char* in, size_t len, gca_buf* out,
+                   unsigned long mode);
 
 /* Burrows-Wheeler transform (gcac.exe sub_40EEC0 / sub_40F1F0) */
 int gca_bwt_encode(const unsigned char* in, size_t n, gca_buf* out,
@@ -176,6 +184,10 @@ typedef struct {
     /* 0 = the modern GCAX container, 1 = a legacy container
        (GCA0 / GCA1 / a standalone GCA3) which is not supported */
     int            legacy;
+    /* set when the directory CRC or the legacy trailer CRC is wrong */
+    int            crc_error;
+    /* a legacy GCA0/GCA1 container with an encrypted directory */
+    int            legacy_encrypted;
     unsigned long  num_files;
     gca_member*    members;
     size_t         payload_off; /* start of the payload region */
