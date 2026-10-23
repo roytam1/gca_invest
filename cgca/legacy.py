@@ -113,6 +113,19 @@ def main():
             check("gcac.exe agrees on %s" % name,
                   rc == 0 and tree(outg) == t)
 
+    # key-file encryption (the key is SHA-1 hashed like -p)
+    src = os.path.join(FIXTURES, "gcacv09e_encrypted_key.gca")
+    keyfile = os.path.join(FIXTURES, "gcacv09e_key.bin")
+    out = os.path.join(tmp, "keyfile")
+    rc, _, _ = sh([UNPACK, "e", src, out, "-k", keyfile])
+    check("extract gcacv09e_encrypted_key.gca", rc == 0 and
+          reference is not None and tree(out) == reference)
+    if HAVE_GCAC:
+        outg = os.path.join(tmp, "keyfile_gcac")
+        rc, _, _ = sh([GCAC, "e", src, outg, "-k", keyfile])
+        check("gcac.exe agrees on gcacv09e_encrypted_key.gca",
+              rc == 0 and tree(outg) == reference)
+
     # encrypted archives must not be silently parsed without a password
     rc, _, _ = sh([UNPACK, "l", os.path.join(FIXTURES,
                                              "gcacv09e_encrypted.gca")])
