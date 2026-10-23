@@ -374,8 +374,9 @@ The layout was confirmed against real archives kept in `fixtures/`:
 `fixtures/gcasdk_v09d.gca` (GCA1, written by the GCA SDK 0.9d),
 `fixtures/gcatxt.gca` (GCA0, written by the GCA SDK 0.9e), and the five
 `fixtures/gcacv09e_*.gca` archives written by **gcac_v09e.exe** (plain,
-solid, non-compressed, encrypted and encrypted-solid).  `gcac.exe`, the C
-tools in `cgca/` and the C++ SDK extract them identically. **[V]**
+solid, non-compressed, encrypted, encrypted-solid and encrypted with a key
+file).  `gcac.exe`, the C tools in `cgca/` and the C++ SDK extract them
+identically. **[V]**
 
 `gcac_v09e.exe` is the legacy writer; `gcac.exe` 0.9k only reads these
 containers.  Both legacy layouts have a header variant word at `+0x04`:
@@ -521,9 +522,9 @@ After decryption, flags bit 0 means the payload is compressed, bit 1 means
 the trailer CRC is present, and bit 2 means the directory is encrypted.  The
 trailer CRC covers the **decrypted** header and directory up to the four
 zero bytes.  The payload is raw when bit 0 is clear (`n` mode), otherwise it
-is ordinary `GCF0`/`GCF1`/`GCF2` frames.  The five
+is ordinary `GCF0`/`GCF1`/`GCF2` frames.  The
 `fixtures/gcacv09e_*.gca` archives cover plain, solid, non-compressed,
-encrypted and encrypted-solid cases. **[V]**
+encrypted, encrypted-solid and key-file cases. **[V]**
 
 ---
 
@@ -579,6 +580,7 @@ build\gcac_unpack.exe fixtures\gcacv09e_plain.gca -o dest      # GCA0
 build\gcac_unpack.exe fixtures\gcacv09e_none.gca  -o dest      # GCA0, raw
 build\gcac_unpack.exe fixtures\gcacv09e_encrypted.gca -p fixture -o dest
 build\gcac_unpack.exe fixtures\gcacv09e_encrypted_solid.gca -p fixture -o dest
+build\gcac_unpack.exe fixtures\gcacv09e_encrypted_key.gca -k fixtures\gcacv09e_key.bin -o dest
 ```
 
 The corpus used while writing this document was produced with:
