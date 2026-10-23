@@ -7,6 +7,7 @@
 //   -s        solid mode (all members share one payload stream)
 //   -n        no compression (store the members verbatim)
 //   -C        compress the directory block when it pays off (default)
+//   -L        write a legacy GCA0/GCA1 container (gcac_v09e layout)
 //   -o<file>  order list: one path per line (whitespace separated)
 //   -d        keep the directory part of -o entries (default: base name)
 //   -p <pw>   password for encryption
@@ -16,7 +17,8 @@
 // A folder argument is walked recursively and its files are stored under
 // the folder's name.  gcac.exe orders the members by extension and then
 // by base name; this packer does the same, which makes folder archives
-// byte identical to the ones gcac.exe produces.
+// byte identical to the ones gcac.exe produces.  -L writes the older
+// GCA0/GCA1 layout read by gcac.exe and written by gcac_v09e.exe.
 ///////////////////////////////////////////////////////////////
 #include "gca.h"
 
@@ -624,6 +626,7 @@ static void gca_usage(void)
         "  -s         solid mode (all members share one payload stream)\n"
         "  -n         no compression (store the members verbatim)\n"
         "  -C         compress the directory block when it pays off (default)\n"
+        "  -L         write a legacy GCA0/GCA1 container (gcac_v09e layout)\n"
         "  -o <file>  order list: one path per line (or -o<file>)\n"
         "  -d         keep the directory part of -o entries\n"
         "  -p <pw>    password for encryption (or -p<pw>)\n"
@@ -657,6 +660,7 @@ int main(int argc, char** argv)
     char keyhex[41];
     char archive_buf[1024];
     int solid = 0, compress = 1, dircomp = 1, dircomp_opt = 0, keep_dir = 0;
+    int legacy = 0, keyfile = 0;
     int cmd = 0;
     int i;
 
@@ -700,8 +704,11 @@ int main(int argc, char** argv)
                 dircomp_opt = 1;
             } else if (lower == 'd') {
                 keep_dir = 1;
+            } else if (lower == 'l') {
+                legacy = 1;
             } else if (lower == 'p') {
                 spell = val;
+                keyfile = 0;
             } else if (lower == 'k') {
                 if (gca_load_keyfile(val, keyhex) != 0) {
                     fprintf(stderr, "cannot read key file %s\n", val);
@@ -709,6 +716,7 @@ int main(int argc, char** argv)
                     return 1;
                 }
                 spell = keyhex;
+                keyfile = 1;
             } else if (lower == 'o') {
                 listfile = val;
             } else {
@@ -760,7 +768,7 @@ int main(int argc, char** argv)
         return 2;
     }
 
-    gca_writer_init(&w, solid, compress, dircomp, spell);
+    gca_writer_init(&w, solid, compress, dircomp, legacy, keyfile, spell);
 
     if (listfile) {
         if (gca_add_list_file(&w, listfile, keep_dir) != 0) {

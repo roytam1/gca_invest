@@ -944,12 +944,15 @@ int gca_arc_extract(gca_archive* arc, unsigned long index, const char* outdir)
 /* ---------------------------------------------------------------- */
 /* writer                                                            */
 void gca_writer_init(gca_writer* w, int solid, int compress,
-                     int dir_compress, const char* spell)
+                     int dir_compress, int legacy, int keyfile,
+                     const char* spell)
 {
     memset(w, 0, sizeof(*w));
     w->solid = solid;
     w->compress = compress;
     w->dir_compress = dir_compress;
+    w->legacy = legacy;
+    w->keyfile = keyfile;
     w->spell = spell;
 }
 
@@ -998,6 +1001,209 @@ int gca_pack_add(gca_writer* w, const char* name,
     return 0;
 }
 
+/* Build a legacy GCA0/GCA1 (variant 2) container, matching the layout
+ * written by gcac_v09e.exe.  The +0x14 field of each entry is uninitialized
+ * in that writer; this writer stores zero there, which readers ignore. */
+static int gca_pack_finish_legacy(gca_writer* w, const char* path)
+{
+    gca_buf payload, dir, names, head;
+    unsigned long* stored = NULL;
+    size_t* idx = NULL;
+    size_t count = 0, i, k, pos;
+    unsigned long crc, hdrOff;
+    unsigned long flags;
+    unsigned char hdr[0x24];
+    FILE* fp = NULL;
+    int encrypted = (w->spell && *w->spell);
+    int rc = -1;
+
+    if (w->solid && !w->compress) {
+        fprintf(stderr, "legacy solid archives must be compressed\n");
+        return -1;
+    }
+
+    for (i = 0; i < w->nsrc; i++)
+        if (!(w->srcs[i].attr & 0x10))
+            count++;
+    if (count == 0) {
+        fprintf(stderr, "legacy archives cannot store empty directories\n");
+        return -1;
+    }
+    gca_buf_init(&payload);
+    gca_buf_init(&dir);
+    gca_buf_init(&names);
+    gca_buf_init(&head);
+
+    idx = (size_t*)malloc(sizeof(size_t) * count);
+    stored = (unsigned long*)calloc(count, sizeof(unsigned long));
+    if (!idx || !stored)
+        goto done;
+    k = 0;
+    for (i = 0; i < w->nsrc; i++)
+        if (!(w->srcs[i].attr & 0x10))
+            idx[k++] = i;
+
+    if (w->solid) {
+        gca_buf all;
+        gca_buf_init(&all);
+        for (k = 0; k < count; k++)
+            gca_buf_put(&all, w->srcs[idx[k]].data, w->srcs[idx[k]].len);
+        pos = 0;
+        if (w->compress) {
+            while (pos < all.len) {
+                size_t n = all.len - pos;
+                if (n > GCA_BLOCK_SIZE)
+                    n = GCA_BLOCK_SIZE;
+                if (gca_frame_write(&payload, all.data + pos, n) != 0) {
+                    gca_buf_free(&all);
+                    goto done;
+                }
+                pos += n;
+            }
+        } else {
+            gca_buf_put(&payload, all.data, all.len);
+        }
+        gca_buf_free(&all);
+        for (k = 0; k < count; k++)
+            stored[k] = 0;
+    } else if (w->compress) {
+        for (k = 0; k < count; k++) {
+            size_t p = 0;
+            size_t before = payload.len;
+            while (p < w->srcs[idx[k]].len) {
+                size_t n = w->srcs[idx[k]].len - p;
+                if (n > GCA_BLOCK_SIZE)
+                    n = GCA_BLOCK_SIZE;
+                if (gca_frame_write(&payload,
+                                    w->srcs[idx[k]].data + p, n) != 0)
+                    goto done;
+                p += n;
+            }
+            stored[k] = (unsigned long)(payload.len - before);
+        }
+    } else {
+        for (k = 0; k < count; k++) {
+            gca_buf_put(&payload, w->srcs[idx[k]].data,
+                        w->srcs[idx[k]].len);
+            stored[k] = (unsigned long)w->srcs[idx[k]].len;
+        }
+    }
+
+    for (k = 0; k < count; k++) {
+        size_t n = strlen(w->srcs[idx[k]].name);
+        if (n > 255) {
+            fprintf(stderr, "legacy member name is too long: %s\n",
+                    w->srcs[idx[k]].name);
+            goto done;
+        }
+        gca_buf_putc(&names, (int)n);
+        gca_buf_put(&names, w->srcs[idx[k]].name, n);
+    }
+
+    flags = (w->compress ? 1UL : 0UL) | 2UL | (encrypted ? 4UL : 0UL);
+    for (k = 0; k + 1 < count; k++) {
+        unsigned char e[32];
+        gca_src* prev = &w->srcs[idx[k]];
+        gca_src* next = &w->srcs[idx[k + 1]];
+        memset(e, 0, sizeof(e));
+        gca_wr32(e + 0x00, prev->attr);
+        gca_wr32(e + 0x04, prev->ft_lo);
+        gca_wr32(e + 0x08, prev->ft_hi);
+        gca_wr32(e + 0x0C, flags);
+        gca_wr32(e + 0x10, next->crc);
+        gca_wr32(e + 0x14, 0);
+        gca_wr32(e + 0x18, stored[k + 1]);
+        gca_wr32(e + 0x1C, (unsigned long)next->len);
+        gca_buf_put(&dir, e, 32);
+    }
+    {
+        gca_src* last = &w->srcs[idx[count - 1]];
+        unsigned char r[12];
+        gca_wr32(r + 0, last->attr);
+        gca_wr32(r + 4, last->ft_lo);
+        gca_wr32(r + 8, last->ft_hi);
+        gca_buf_put(&dir, r, 12);
+    }
+    gca_buf_put(&dir, names.data, names.len);
+    gca_buf_put32(&dir, 0);             /* the four zero bytes */
+
+    hdrOff = 0x24 + (unsigned long)dir.len + 4;
+    memset(hdr, 0, sizeof(hdr));
+    memcpy(hdr, w->solid ? "GCA1" : "GCA0", 4);
+    gca_wr32(hdr + 0x04, encrypted ? 6 : 2);
+    gca_wr32(hdr + 0x08, (unsigned long)count);
+    gca_wr32(hdr + 0x0C, hdrOff);
+    gca_wr32(hdr + 0x10, flags);
+    gca_wr32(hdr + 0x14, w->srcs[idx[0]].crc);
+    gca_wr32(hdr + 0x18, (encrypted && !w->keyfile) ? 0x74614470UL
+                                                      : 0x0F00000FUL);
+    gca_wr32(hdr + 0x1C, w->solid ? 0 : stored[0]);
+    gca_wr32(hdr + 0x20, (unsigned long)w->srcs[idx[0]].len);
+
+    crc = gca_crc32(hdr, sizeof(hdr), 0);
+    crc = gca_crc32(dir.data, dir.len, crc);
+    if (gca_buf_put32(&dir, crc) != 0)
+        goto done;
+
+    if (gca_buf_put(&head, hdr, sizeof(hdr)) != 0 ||
+        gca_buf_put(&head, dir.data, dir.len) != 0)
+        goto done;
+
+    if (encrypted) {
+        gca_buf key;
+        gca_crypt ks;
+        if (gca_key_dir(w->spell, &key) != 0)
+            goto done;
+        gca_crypt_setkey(&ks, key.data, key.len);
+        gca_buf_free(&key);
+        gca_crypt_xor(&ks, head.data + 0x10, head.len - 0x10);
+
+        if (w->solid) {
+            if (gca_key_solid(w->spell, &key) != 0)
+                goto done;
+            gca_crypt_setkey(&ks, key.data, key.len);
+            gca_buf_free(&key);
+            gca_crypt_xor(&ks, payload.data, payload.len);
+        } else {
+            pos = 0;
+            for (k = 0; k < count; k++) {
+                if (gca_key_payload(w->spell, w->srcs[idx[k]].name,
+                                    &key) != 0)
+                    goto done;
+                gca_crypt_setkey(&ks, key.data, key.len);
+                gca_buf_free(&key);
+                if (stored[k])
+                    gca_crypt_xor(&ks, payload.data + pos, stored[k]);
+                pos += stored[k];
+            }
+        }
+    }
+
+    fp = fopen(path, "wb");
+    if (!fp)
+        goto done;
+    if (fwrite(head.data, 1, head.len, fp) != head.len ||
+        (payload.len && fwrite(payload.data, 1, payload.len, fp)
+                         != payload.len)) {
+        fclose(fp);
+        goto done;
+    }
+    fclose(fp);
+    fp = NULL;
+    rc = 0;
+
+done:
+    if (fp)
+        fclose(fp);
+    if (idx) free(idx);
+    if (stored) free(stored);
+    gca_buf_free(&payload);
+    gca_buf_free(&dir);
+    gca_buf_free(&names);
+    gca_buf_free(&head);
+    return rc;
+}
+
 /* Build the payload region and the directory, then write the file. */
 int gca_pack_finish(gca_writer* w, const char* path)
 {
@@ -1009,6 +1215,9 @@ int gca_pack_finish(gca_writer* w, const char* path)
     unsigned char hdr[16], dhdr[32];
     unsigned long crc, numFiles = (unsigned long)w->nsrc;
     unsigned long blockSize;
+
+    if (w->legacy)
+        return gca_pack_finish_legacy(w, path);
 
     gca_buf_init(&payload);
     gca_buf_init(&entries);

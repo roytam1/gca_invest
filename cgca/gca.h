@@ -218,6 +218,8 @@ typedef struct {
     int          solid;        /* concatenate all members into one stream */
     int          compress;     /* 0 = store, 1 = compress */
     int          dir_compress; /* compress the directory block */
+    int          legacy;       /* write a legacy GCA0/GCA1 container */
+    int          keyfile;      /* the password came from -k */
     const char*  spell;        /* password, or NULL */
     gca_src*     srcs;
     size_t       nsrc;
@@ -225,7 +227,8 @@ typedef struct {
 } gca_writer;
 
 void gca_writer_init(gca_writer* w, int solid, int compress,
-                     int dir_compress, const char* spell);
+                     int dir_compress, int legacy, int keyfile,
+                     const char* spell);
 void gca_writer_free(gca_writer* w);
 
 /* Add one member.  `data` is copied. */
