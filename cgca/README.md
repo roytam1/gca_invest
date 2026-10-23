@@ -70,5 +70,7 @@
 //     gcac_v09e layout; gcac.exe and gcac_v09e.exe read them.  The
 //     bytes are not identical to v09e output because v09e leaves two
 //     header/entry fields uninitialized; the meaningful fields and the
-//     CRC agree.  Legacy archives cannot store empty directories.
+//     CRC agree.  Legacy output uses variant 2, one-byte name lengths
+//     (at most 255 bytes), skips empty directories, and rejects
+//     solid+raw (-s -n) because the original readers cannot decode it.
 ///////////////////////////////////////////////////////////////

@@ -547,8 +547,9 @@ modern archives are **byte identical**, including folder archives.
 `gcac.exe`, `gcac_v09e.exe`, `gcac_unpack` and `GcaSDK`, but are not byte
 identical to v09e output: v09e leaves the header `+0x18` marker and entry
 `+0x14` bytes uninitialized, while this writer uses fixed values.  The
-meaningful fields and the CRC agree.  Legacy archives cannot store empty
-directories.
+meaningful fields and the CRC agree.  Legacy output uses variant 2, one-byte
+name lengths (at most 255 bytes), skips empty directories, and rejects
+solid+raw (`-L -s -n`) because the original readers cannot decode it.
 
 Both decoders (C and C++) handle the legacy containers, including the
 encrypted version 6, restore file attributes and timestamps, and validate
