@@ -20,6 +20,7 @@
 //
 //   python roundtrip.py       flat corpus, both directions, byte for byte
 //   python parity.py          folders, empty dirs, attributes, CLI
+//   python legacy.py          gcac_v09e fixtures, including encryption
 //
 // The format is documented in ../GCA_FORMAT.md.  Two legacy archives
 // (fixtures/ in the repository root) are used as test fixtures.
@@ -58,8 +59,9 @@
 //   * The archive may be embedded in a larger file (an SFX stub): the
 //     unpacker locates the GCAX header automatically.
 //   * The unpacker also reads the legacy GCA0 and GCA1 containers (the
-//     pre-0.9 layouts, see ../GCA_FORMAT.md section 7).  A standalone
-//     GCA3 file is not supported: "GCA3" is the directory block magic,
-//     not a file container, and gcac.exe's own handling of that case
-//     is broken (see ../GCA_FORMAT.md section 7.5).
+//     pre-0.9 layouts, see ../GCA_FORMAT.md section 7), including the
+//     encrypted variant 6 written by gcac_v09e.exe.  A standalone GCA3
+//     file is not supported: "GCA3" is the directory block magic, not
+//     a file container, and gcac.exe's own handling of that case is
+//     broken (see ../GCA_FORMAT.md section 7.5).
 ///////////////////////////////////////////////////////////////

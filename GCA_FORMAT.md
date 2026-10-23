@@ -370,15 +370,18 @@ SHA-1 used by `-k`.
 | `GCA1` | legacy container, solid (one payload stream for every member) |
 | `GCA3` | a directory block standing on its own, without a GCAX envelope — **not supported**, see §7.5 |
 
-The layout was confirmed against two real archives, kept in `fixtures/`:
-`fixtures/gcasdk_v09d.gca` (GCA1, written by the GCA SDK 0.9d) and
-`fixtures/gcatxt.gca` (GCA0, written by the GCA SDK 0.9e).  `gcac.exe`,
-the C tools in `cgca/` and the C++ SDK all extract both of them byte
-identically. **[V]**
+The layout was confirmed against real archives kept in `fixtures/`:
+`fixtures/gcasdk_v09d.gca` (GCA1, written by the GCA SDK 0.9d),
+`fixtures/gcatxt.gca` (GCA0, written by the GCA SDK 0.9e), and the five
+`fixtures/gcacv09e_*.gca` archives written by **gcac_v09e.exe** (plain,
+solid, non-compressed, encrypted and encrypted-solid).  `gcac.exe`, the C
+tools in `cgca/` and the C++ SDK extract them identically. **[V]**
 
-Both legacy layouts have a header variant word at `+0x04`:
+`gcac_v09e.exe` is the legacy writer; `gcac.exe` 0.9k only reads these
+containers.  Both legacy layouts have a header variant word at `+0x04`:
 
-* **variant 2** — the directory is stored in the clear;
+* **variant 2** — the directory is stored in the clear (version 2, or
+  version 6 when encrypted);
 * **variant 3** — the directory is stored as two `GCF1` frames.
 
 ### 7.1 Variant 2 — the plain directory
@@ -388,9 +391,11 @@ Both legacy layouts have a header variant word at `+0x04`:
 +0x04  4  the header variant (2)
 +0x08  4  the number of members
 +0x0C  4  hdr — the offset of the payload region
-+0x10  4  flags (meaning unknown)
++0x10  4  flags: bit 0 payload compressed, bit 1 CRC present,
++          bit 2 directory encrypted (see §7.6)
 +0x14  4  the CRC-32 of the first member's content
-+0x18  4  (unidentified)
++0x18  4  (unidentified; `0x0F00000F` in plain archives and `"pDat"`
++          for passwords in the 0.9e writer)
 +0x1C  4  the first member's stored size
 +0x20  4  the first member's original size
 +0x24  .. the directory
@@ -400,25 +405,33 @@ The directory:
 
 ```
 (cnt-1) 32 byte entries
-the first member's 12 byte record: {u32 32, u32 FILETIME low, u32 FILETIME high}
+the last member's 12 byte record: {u32 attributes, FILETIME low, FILETIME high}
 the names pool: cnt times (one byte length + the name)
 4 zero bytes
 u32  the CRC-32 of everything from the start of the file up to and
      including those 4 zero bytes
 ```
 
-The 32 byte entries:
+The 32 byte entries are **rotated**: an entry carries the metadata
+(attributes and FILETIME) of the *previous* member and the CRC/sizes of the
+*next* member.  The first member's CRC and sizes are in the header, and the
+last member's metadata is the 12 byte record.
 
 | off | value |
 |-----|-------|
-| +0x00 | 32 (the entry size) |
-| +0x04 | FILETIME low |
-| +0x08 | FILETIME high |
-| +0x0C | `dwFileAttributes` |
-| +0x10 | CRC-32 of the content |
-| +0x14 | (unused) |
-| +0x18 | the stored size |
-| +0x1C | the original size |
+| +0x00 | attributes of the previous member |
+| +0x04 | its FILETIME low |
+| +0x08 | its FILETIME high |
+| +0x0C | 3 (constant; likely a compression method) |
+| +0x10 | CRC-32 of the next member |
+| +0x14 | (unused / stale bytes) |
+| +0x18 | stored size of the next member |
+| +0x1C | original size of the next member |
+
+For example, for three members `0,1,2`:
+entry 1 has metadata of 0 and data of 1; entry 2 has metadata of 1 and data
+of 2; the 12 byte record has metadata of 2; the header has data of 0.
+For `cnt == 1` there are no entries and the record sits at `+0x24`. **[V]**
 
 ### 7.2 Variant 3 — the compressed directory
 
@@ -493,11 +506,24 @@ treated as an unknown format rather than a GCA archive.  **[V]**
 
 ### 7.6 Encrypted legacy containers
 
-`gcac.exe` also reads `GCA0`/`GCA1` containers whose directory is
-encrypted (flag bit `0x04`).  The two fixtures in `fixtures/` are plain,
-and 0.9k cannot write these containers, so this path has no test sample.
-`cgca` marks such a container as unsupported instead of parsing the
-ciphertext as names.  The modern GCAX encryption is fully implemented.
+`gcac_v09e.exe` writes encrypted `GCA0`/`GCA1` containers with header
+version **6**; `gcac.exe` 0.9k reads them.  The layout is variant 2 after
+decryption, with flag bit `0x04` set:
+
+| region | cipher |
+|--------|--------|
+| `+0x00..+0x0F` | plaintext (magic, version 6, member count, `hdr`) |
+| `+0x10..hdr-1` | `<password>Header`, keystream starting at byte 0 |
+| payload of member *i* | `<password><stored name>` |
+| payload (solid) | `<password>` |
+
+After decryption, flags bit 0 means the payload is compressed, bit 1 means
+the trailer CRC is present, and bit 2 means the directory is encrypted.  The
+trailer CRC covers the **decrypted** header and directory up to the four
+zero bytes.  The payload is raw when bit 0 is clear (`n` mode), otherwise it
+is ordinary `GCF0`/`GCF1`/`GCF2` frames.  The five
+`fixtures/gcacv09e_*.gca` archives cover plain, solid, non-compressed,
+encrypted and encrypted-solid cases. **[V]**
 
 ---
 
@@ -530,6 +556,7 @@ build\gcac_unpack.exe e out.gca dest          # extract
 
 python roundtrip.py    # flat corpus, both directions, byte for byte
 python parity.py       # folders, empty dirs, attributes, CLI, byte equity
+python legacy.py       # the gcac_v09e legacy fixtures, including encryption
 ```
 
 ## 9. Reproducing / verifying
@@ -542,12 +569,16 @@ build\gcatest.exe <archive.gca> [outdir] [spell]
 `spell` is the password (the raw `-p` text, or the lower case hex SHA-1 of the
 `-k` key file).  Without it, encrypted archives report `OPEN_FAILED`.
 
-The two legacy archives in `fixtures/` are checked by `cgca/roundtrip.py`
-as well:
+The legacy archives in `fixtures/` are checked by `cgca/roundtrip.py` and
+`cgca/legacy.py`:
 
 ```
-build\gcac_unpack.exe fixtures\gcasdk_v09d.gca -o dest   # GCA1, solid
-build\gcac_unpack.exe fixtures\gcatxt.gca       -o dest   # GCA0, plain
+build\gcac_unpack.exe fixtures\gcasdk_v09d.gca -o dest        # GCA1, solid
+build\gcac_unpack.exe fixtures\gcatxt.gca       -o dest        # GCA0, plain
+build\gcac_unpack.exe fixtures\gcacv09e_plain.gca -o dest      # GCA0
+build\gcac_unpack.exe fixtures\gcacv09e_none.gca  -o dest      # GCA0, raw
+build\gcac_unpack.exe fixtures\gcacv09e_encrypted.gca -p fixture -o dest
+build\gcac_unpack.exe fixtures\gcacv09e_encrypted_solid.gca -p fixture -o dest
 ```
 
 The corpus used while writing this document was produced with:
